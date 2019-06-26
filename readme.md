@@ -35,6 +35,13 @@ cd fastText
 pip3 install .
 ```
 
+### Datasets
+Multiple datasets are supported for the methods in this repository. The download_datasets.py Python module has both the URLs and the code to download and decompress the datasets. However, the word2vec pretrained model requires a manual download, click [here](https://drive.google.com/uc?export=download&confirm=YjKc&id=0B7XkCwpI5KDYNlNUTTlSS21pQmM) to download the file from Google Drive. Store it under datasets/word2vec folder. Now, run the module to download and decompress the remaining datasets
+
+```
+python3 download_datasets.py
+```
+
 ### Running experiments
 A Python script with experiments encodes the parameters for the experiments and allows to easily replicate results. Based on the content of this script, modifications can be performed for additional testing. For running them, activate the virtual environment and run the script
 
