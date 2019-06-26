@@ -20,6 +20,7 @@ from sklearn.preprocessing import StandardScaler
 from sklearn.feature_extraction.text import TfidfTransformer
 from sklearn.feature_extraction.text import CountVectorizer
 from sklearn.model_selection import train_test_split
+from sklearn.model_selection import ShuffleSplit
 
 # Print the whole arrays and set random seed
 np.set_printoptions(threshold=sys.maxsize)
@@ -77,11 +78,15 @@ class representation(object):
     [1] https://github.com/facebookresearch/fastText/blob/master/docs/crawl-vectors.md
     [2] https://radimrehurek.com/gensim/models/fasttext.html
     """
-
+    
     model = load_facebook_vectors('datasets/fasttext/cc.en.300.bin')
     vectors = model
-    return self.compute_avg_embeddings(text_data, vectors)
 
+    if isinstance(text_data[0], list):
+      return self.compute_array_avg_embeddings(text_data, vectors)
+    else:
+      return self.compute_avg_embeddings(text_data, vectors)
+      
   def word2vec(self, text_data):
     """
     Pretrained word embeddings from word2vec
@@ -160,8 +165,44 @@ class representation(object):
           print('\t  ' + word + ' not in vocabulary')
         embedding.append(vector)
 
+      if len(embedding) == 0:
+        embedding.append(not_in_vocabulary)
+
       embedding = np.asarray(embedding, dtype=np.float32)
       embeddings.append(np.mean(embedding, axis=0))
+
+    return embeddings
+
+  def compute_array_avg_embeddings(self, text_data, vectors):
+    """
+    Calculate embeddings for every array of sentences in text_data array. 
+    Use the model stored in vectors to retrieve pretrained word embeddings 
+    and compute the average of word vectors
+    """
+
+    embedding_length = len(vectors['tree'])
+    embeddings = []
+
+    for queries in text_data: 
+      embedding_array = []
+      for query in queries:
+        not_in_vocabulary = [0.0 for i in range(embedding_length)]
+        embedding = []
+        
+        for _, word in enumerate(query.split()):
+          try:
+            vector = vectors[word]
+          except:
+            vector = not_in_vocabulary
+            print('\t  ' + word + ' not in vocabulary')
+          embedding.append(vector)
+
+        if len(embedding) == 0:
+          embedding.append(not_in_vocabulary)
+
+        embedding = np.asarray(np.mean(embedding, axis=0), dtype=np.float32)
+        embedding_array.append(embedding)
+      embeddings.append(embedding_array)
 
     return embeddings
 
@@ -190,6 +231,8 @@ class mnist(object):
     self.data = x
     self.labels = y
 
+    print(self.data.shape)
+
 class iris(object):
   """
   Popular flowers dataset for testing purposes
@@ -210,6 +253,7 @@ class iris(object):
     iris = datasets.load_iris()
     self.data   = iris.data
     self.labels = iris.target
+    print(self.data.shape)
 
 class aol_procheta(object):
   """
@@ -228,7 +272,7 @@ class aol_procheta(object):
 
   def load(self, textdata=False):
     """
-    Load data into object variables according to the specified representation
+    Load data into object variables according to the specified representation. If textdata is True, do not compute any representation for the queries
     """
 
     with open(self.file, mode='r') as data_file:
@@ -249,6 +293,11 @@ class aol_procheta(object):
     self.data = self.data[permutation]
     self.labels = self.labels[permutation]
 
+    if np.min(self.labels) != 0:
+      print('Adjusting labels to start from 0')
+      self.labels -= 1
+      assert np.min(self.labels) == 0
+      
     print("Data size: " + str(self.data.shape))
 
   def save_additional_info(self):
@@ -395,16 +444,20 @@ class aol_gayo(object):
     self.user_ids   = []
     self.timestamps = []
     self.scaler     = None
+    self.time_ids   = []
 
     self.compute_representation = representation
 
-  def load(self, permutation=True):
+    self.k = 10
+    self.splits = None
+
+  def read_csv(self):
     """
-    Load data into object variables according to the specified representation
+    Read and parse CSV file for the dataset
     """
 
     with open(self.file, mode='r') as data_file:
-      format = '%Y-%m-%d %H:%M:%S'
+      time_format = '%Y-%m-%d %H:%M:%S'
       now = datetime.now(timezone.utc)
       reader = csv.reader(data_file, delimiter='\t')
       for row in reader:
@@ -412,8 +465,15 @@ class aol_gayo(object):
           continue
         self.user_ids.append(int(row[0]))
         self.data.append(row[1].strip())
-        self.timestamps.append(now.strptime(row[2], format))
+        self.timestamps.append(now.strptime(row[2], time_format))
         self.labels.append(int(row[5])) # Mission ID 
+
+  def load(self, permutation=False):
+    """
+    Load data into object variables according to the specified representation
+    """
+
+    self.read_csv()
          
     self.data = self.compute_representation(self.data)
     
@@ -427,25 +487,39 @@ class aol_gayo(object):
 
     print("Data size: " + str(self.data.shape))
 
+  def compute_time_ids(self):
+    """
+    Use query timestamp and user IDs in order to ocompute time ids
+    """
+    time_id = 1
+    user_id = 0
+    self.time_ids.append(time_id)
+
+    for i in range(1, len(self.timestamps)):
+      if user_id != self.user_ids[i]:
+        time_id = 1
+        user_id = self.user_ids[i]
+      else:
+        tdelta = self.timestamps[i] - self.timestamps[i - 1]        
+        gap = float(abs(tdelta.total_seconds()))
+        if gap > 60 * 26:
+          time_id += 1
+      
+      self.time_ids.append(time_id)
+
   def load_sequential_pair(self):
     """
     Load data in sequential pairs of queries, tagging with a one
-    when there is a task change, zero otherwise
+    when there is a task change, zero otherwise. Include time gap in the vectors
     """
 
-    with open(self.file, mode='r') as data_file:
-      reader = csv.reader(data_file, delimiter='\t')
-      for row in reader:
-        if len(row) == 0 or row[0] == 'UserID' or row[0].startswith('---'):
-          continue
-        self.data.append(row[1].strip())
-        self.labels.append(int(row[5])) # Mission ID 
+    self.read_csv()
 
-    pairs = []
-    tags = []
+    pairs, tags, gaps = [], [], [] 
     for i in range(len(self.data) - 1):
-      pairs.append(self.data[i] + ' ' + self.data[i+1])
-
+      pairs.append([self.data[i], self.data[i+1]])
+      tdelta = self.timestamps[i] - self.timestamps[i+1]
+      gaps.append(float(abs(tdelta.total_seconds())))
       if self.labels[i] == self.labels[i+1]:
         tags.append(0)
       else:
@@ -453,24 +527,109 @@ class aol_gayo(object):
 
     self.data = self.compute_representation(pairs) 
     self.labels = tags
-
     self.data = np.asarray(self.data, dtype=np.float32)
     self.labels = np.asarray(self.labels, dtype=np.int32)
-  
-    permutation = np.random.permutation(self.labels.shape[0])
-    self.data = self.data[permutation]
-    self.labels = self.labels[permutation]
-    
+
+    gaps = np.asarray(gaps, dtype=np.float32)
+    mean_gap = np.mean(gaps)
+    std_gap = np.std(gaps)
+    gaps -= mean_gap
+    gaps /= std_gap
+
+    data_len = len(self.data[0, 0])
+    temp = []
+    for i in range(len(self.data)):
+      time_gap = np.full((1, data_len), gaps[i])
+      temp.append(np.append(self.data[i], time_gap, axis=0)) 
+    self.data = np.asarray(temp, dtype=np.float32)
+
     print('Entry shape: ' + str(self.data[0].shape))
     print('Data shape:  ' + str(self.data.shape))
 
-  def split_dataset(self):
+  def load_sequential_queries(self, m=0, n=1):
+    """
+    Load a sequential group of m + n + 1 queries, tagging with a one
+    when there is a task change, zero otherwise. Include time gap information
+    """
+
+    assert(n > 0)
+    self.read_csv()
+
+    groups, tags, gaps = [], [], [] 
+    for i in range(len(self.data) - 1):
+      group, group_gaps = [], []
+      t0 = self.timestamps[i]
+      for j in range(i - m, i):
+        if j >= 0:
+          group.append(self.data[j])
+          tdelta = t0 - self.timestamps[j]
+          group_gaps.append(float(tdelta.total_seconds()))
+        else:
+          group.append('')
+          group_gaps.append(0.0)
+
+      for j in range(i, i + n + 1):
+        if j < len(self.data):
+          group.append(self.data[j])
+          tdelta = t0 - self.timestamps[j]
+          group_gaps.append(float(tdelta.total_seconds()))
+        else:
+          group.append('')
+          group_gaps.append(0.0)
+
+      groups.append(group)
+      gaps.append(group_gaps)
+
+      if self.labels[i] == self.labels[i+1]:
+        tags.append(0)
+      else:
+        tags.append(1)
+    
+    self.data = self.compute_representation(groups) 
+    self.labels = tags
+    self.data = np.asarray(self.data, dtype=np.float32)
+    self.labels = np.asarray(self.labels, dtype=np.int32)
+
+    gaps = np.asarray(gaps, dtype=np.float32)
+    mean_gap = np.mean(gaps)
+    std_gap = np.std(gaps)
+    gaps -= mean_gap
+    gaps /= std_gap
+
+    temp = []
+    for i in range(len(self.data)):
+      temp.append(np.append(self.data[i], np.transpose([gaps[i]]), axis=1)) 
+    self.data = np.asarray(temp, dtype=np.float32)
+
+    print('Entry shape: ' + str(self.data[0].shape))
+    print('Data shape:  ' + str(self.data.shape))
+
+  def split_dataset(self, test_size=0.3):
     """
     Create training (70%) and testing (30%) sets for model learning
     """
     train_data, test_data, train_labels, test_labels = train_test_split(
-      self.data, self.labels, test_size=0.3)
+      self.data, self.labels, test_size=test_size)
     return train_data, test_data, train_labels, test_labels
+
+  def kfold(self, test_size=0.1, k=10):
+    """
+    Create the folds for cross validation. Use shuffle split to create folds
+    randomly
+    """
+    self.k = k
+    kfold = ShuffleSplit(n_splits=self.k, test_size=test_size)
+    self.splits = kfold.split(X=self.data, y=self.labels)
+
+  def next_fold(self):
+    """
+    Get next fold indices. Update train and test sets
+    """
+    train_indices, test_indices = next(self.splits)
+    self.train_data    = self.data[train_indices]
+    self.train_labels  = self.labels[train_indices]
+    self.test_data     = self.data[test_indices]
+    self.test_labels   = self.labels[test_indices]
 
 class reuters(object):
   """
@@ -566,6 +725,3 @@ class reuters(object):
 
 if __name__ == "__main__":
   print('datasets...')
-  lucchese = aol_lucchese(representation=representation().fastText)
-  lucchese.load_sequential_pair()
-  lucchese.split_dataset()

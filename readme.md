@@ -34,3 +34,17 @@ git clone https://github.com/facebookresearch/fastText.git
 cd fastText
 pip3 install .
 ```
+
+### Running experiments
+A Python script with experiments encodes the parameters for the experiments and allows to easily replicate results. Based on the content of this script, modifications can be performed for additional testing. For running them, activate the virtual environment and run the script
+
+```
+source ~/tfcpu/bin/activate 
+python3 experiments.py
+```
+
+You might want to save the command line output to a log file
+
+```
+python3 experiments.py |& tee results.log
+```

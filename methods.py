@@ -2,14 +2,15 @@
 Sesarch session segmentation using a number of methods
 """
 
+import datasets, time, DEC, IDEC, SymDEC
+
 import numpy as np
 from sklearn import metrics
-from sklearn.cluster import KMeans
+from sklearn.cluster import KMeans, DBSCAN, AgglomerativeClustering
 from sklearn.utils.linear_assignment_ import linear_assignment
 from keras.optimizers import SGD
 from keras.initializers import VarianceScaling
 
-import datasets, time, DEC, IDEC, IDEC_DEC, SymDEC, metrics
 import os, gc, time, shutil, glob
 
 import numpy as np
@@ -30,7 +31,7 @@ def unsupervised_accuracy(true_labels, predicted_labels):
     predicted_labels = np.asarray(predicted_labels)
 
     n_labels = predicted_labels.size
-    n_clusters = max(predicted_labels.max(), true_labels.max()) + 1
+    n_clusters = get_num_clusters(true_labels)
     weights = np.zeros((n_clusters, n_clusters), dtype=np.int64)
 
     for i in range(n_labels):
@@ -65,7 +66,35 @@ def rand_index(true_labels, predicted_labels):
 def jaccard_index(true_labels, predicted_labels):
   _, f01, f10, f11 = pairwise_counts(true_labels, predicted_labels)
   return f11 / (f01 + f10 + f11 + 1e-10)
-  
+
+def print_metrics(true_labels, predicted_labels):
+  """ 
+  Command line output
+  """
+
+  print("\nMetrics: ")
+  print("\tAccuracy: %0.5f" % unsupervised_accuracy(
+    true_labels, predicted_labels))
+  print("\tNormalized Mutal Info: %.5f" % metrics.normalized_mutual_info_score(
+    true_labels, predicted_labels))
+  print("\tAdjusted Rand Index: %.5f" % metrics.adjusted_rand_score(
+    true_labels, predicted_labels))
+  print("\tFscore: %.5f" % metrics.f1_score(
+    true_labels, predicted_labels, average='weighted'))
+  print("\tHomogeneity: %0.5f" % metrics.homogeneity_score(
+    true_labels, predicted_labels))
+  print("\tCompleteness: %0.5f" % metrics.completeness_score(
+    true_labels, predicted_labels))
+  print("\tV-measure: %0.5f" % metrics.v_measure_score(
+    true_labels, predicted_labels))
+
+def get_num_clusters(labels):
+  """ Compute the number of clusters from the dataset labels """
+  num_clusters = np.max(labels)
+  if np.min(labels) == 0:
+    num_clusters += 1
+  return num_clusters
+
 def kmeans(data, labels):
   """
   Cluster data by running kmeans implementation in scikit-learn
@@ -73,18 +102,48 @@ def kmeans(data, labels):
   [1] https://scikit-learn.org/stable/auto_examples/text/plot_document_clustering.html#sphx-glr-auto-examples-text-plot-document-clustering-py
   """
 
-  n_clusters = np.amax(labels)
-  if np.amin(labels) == 0:
-    n_clusters += 1
-  print("Number of clusters: " + str(n_clusters))
+  n_clusters = get_num_clusters(labels)
+  print("KMeans. Number of clusters: " + str(n_clusters))
   
   km = KMeans(n_clusters=n_clusters)
+  predicted_labels = km.fit_predict(data, labels)
 
-  return km.fit_predict(data, labels)
+  print_metrics(labels, predicted_labels)
+  return predicted_labels
+
+def dbscan(data, labels):
+  """
+  Cluster data using DBScan 
+
+  [1] https://scikit-learn.org/stable/modules/generated/sklearn.cluster.DBSCAN.html#sklearn.cluster.DBSCAN
+  """
+
+  print("DBScan ")
+  dbscan = DBSCAN(eps=0.5, min_samples=5)  
+  predicted_labels = dbscan.fit_predict(data)
+
+  print_metrics(labels, predicted_labels)
+  return predicted_labels
+
+def aglomerative_clustering(data, labels):
+  """
+  Cluster data using aglomerative implementation in Scikit learn, ward linkage
+
+  [1] https://scikit-learn.org/stable/modules/generated/sklearn.cluster.AgglomerativeClustering.html
+  """
+  
+  n_clusters = get_num_clusters(labels)
+  print("AgglomerativeClustering. Number of clusters: " + str(n_clusters))
+
+  aglomerative = AgglomerativeClustering(n_clusters=n_clusters, linkage='ward')
+  predicted_labels = aglomerative.fit_predict(data)
+  
+  print_metrics(labels, predicted_labels)
+  return predicted_labels
 
 def time_partition(dataset):
   """
-  Consider one task per time session in AOL (Lucchese et al., 2011) dataset. 
+  Consider one task per time session in AOL datasets. 
   Time IDs are based on a time threshold of 26 minutes
   """
   
@@ -142,116 +201,64 @@ def time_segmentation(dataset):
   print("F-score: %0.3f" % metrics.f1_score(
     true_labels, predicted_labels))
 
-def symdec(dataset, save_dir):
+def decs(
+  dataset, 
+  save_dir, 
+  runs=10,
+  pretrain_epochs=30,
+  batch_size=256,
+  gamma=0.1,
+  maxiter=2e4,
+  update_interval=50,
+  tol=0.001
+  ):
   """
-  Run SymDEC
-
-  """
-
-  x = dataset.data
-  y = dataset.labels
-
-  if not os.path.exists(save_dir):
-    os.makedirs(save_dir)
-
-  ae_weights = save_dir + '/ae_weights.h5'
-  n_clusters = np.max(y) + 1
-  batch_size = 256
-  init = VarianceScaling(scale=1. / 3., mode='fan_in',
-    distribution='uniform')  # [-limit, limit], limit=sqrt(1./fan_in)
-
-  # Pretrain autoencoder
-  if not os.path.exists(ae_weights):
-    pretrain_optimizer = SGD(lr=1, momentum=0.9)
-    pretrain_epochs = 50
-    dec = DEC.DEC(
-      dims=[x.shape[-1], 500, 500, 2000, 10], n_clusters=n_clusters, init=init)
-    dec.pretrain(x=x, y=y, optimizer=pretrain_optimizer, epochs=pretrain_epochs,
-      batch_size=batch_size, save_dir=save_dir)
-
-  # Run DEC
-  optimizer = SGD(lr=0.1, momentum=0.99)
-  gamma = 0.1
-  maxiter = 1200
-  update_interval = 50 
-  tol = 0.001
-  
-  # prepare the DEC model
-  dec = SymDEC.DEC(
-    dims=[x.shape[-1], 500, 500, 2000, 10], n_clusters=n_clusters, init=init)
-  dec.autoencoder.load_weights(ae_weights)
-  dec.model.summary()
-
-  # begin clustering, time not include pretraining part.
-  t0 = time.time()
-  dec.compile(optimizer=SGD(0.01, 0.9), loss='kld')
-  y_pred = dec.fit(x, y=y, tol=tol, maxiter=maxiter, batch_size=batch_size, 
-    update_interval=update_interval, save_dir=save_dir)
-
-  accuracy = IDEC_DEC.cluster_acc(y, y_pred)
-  print ('acc:', accuracy)
-  print ('clustering time: ', (time.time() - t0))
-
-  return accuracy, metrics.nmi(y, y_pred), metrics.ari(y, y_pred)
-
-def dec(dataset, save_dir):
-  """
-  Run DEC
-
-  [1] https://github.com/XifengGuo/IDEC
+  Run SymDEC, DEC, and IDEC for the dataset
   """
 
-  x = dataset.data
-  y = dataset.labels
+  dirs = [
+    'models/symdec/'+save_dir,'models/dec/'+save_dir,'models/idec/'+save_dir]
+  methods = [SymDEC.DEC, DEC.DEC, IDEC.IDEC]
 
-  if not os.path.exists(save_dir):
-    os.makedirs(save_dir)
-
-  ae_weights = save_dir + '/ae_weights.h5'
-  n_clusters = np.max(y) + 1
-  batch_size = 256
-  init = VarianceScaling(scale=1. / 3., mode='fan_in',
-    distribution='uniform')  # [-limit, limit], limit=sqrt(1./fan_in)
+  for k in range(len(dirs)):
+    save_dir = dirs[k]
+    method = methods[k]
+    accs, nmis, aris, fscs = [], [], [], []
+    for _ in range(runs):
+      acc, nmi, ari, fsc = dec(
+        dataset, 
+        save_dir,
+        method,
+        pretrain_epochs,
+        batch_size,
+        gamma,
+        maxiter,
+        update_interval,
+        tol
+        )
+      accs.append(acc); nmis.append(nmi); aris.append(ari); fscs.append(fsc)
+    print("\n\nTest results\n")
+    print('\tacc : mean = %.5f  stdev = %.5f' % (np.mean(accs), np.std(accs))) 
+    print('\tnmi : mean = %.5f  stdev = %.5f' % (np.mean(nmis), np.std(nmis))) 
+    print('\tari : mean = %.5f  stdev = %.5f' % (np.mean(aris), np.std(aris))) 
+    print('\tfsc : mean = %.5f  stdev = %.5f' % (np.mean(fscs), np.std(fscs))) 
     
-  # Pretrain autoencoder
-  if not os.path.exists(ae_weights):
-    pretrain_optimizer = SGD(lr=1, momentum=0.9)
-    pretrain_epochs = 50
-    dec = DEC.DEC(
-      dims=[x.shape[-1], 500, 500, 2000, 10], n_clusters=n_clusters, init=init)
-    dec.pretrain(x=x, y=y, optimizer=pretrain_optimizer, epochs=pretrain_epochs,
-      batch_size=batch_size, save_dir=save_dir)
+    print(accs); print(nmis); print(aris);  print(fscs)
 
-  # Run DEC
-  optimizer = SGD(lr=0.1, momentum=0.99)
-  gamma = 0.1
-  maxiter = 2e4
-  update_interval = 50 
-  tol = 0.001
-  
-  # prepare the DEC model
-  dec = DEC.DEC(
-    dims=[x.shape[-1], 500, 500, 2000, 10], n_clusters=n_clusters, init=init)
-  dec.autoencoder.load_weights(ae_weights)
-  dec.model.summary()
-
-  # begin clustering, time not include pretraining part.
-  t0 = time.time()
-  dec.compile(optimizer=SGD(0.01, 0.9), loss='kld')
-  y_pred = dec.fit(x, y=y, tol=tol, maxiter=maxiter, batch_size=batch_size, 
-    update_interval=update_interval, save_dir=save_dir)
-
-  accuracy = IDEC_DEC.cluster_acc(y, y_pred)
-  print ('acc:', accuracy)
-  print ('clustering time: ', (time.time() - t0))
-
-  return accuracy, metrics.nmi(y, y_pred), metrics.ari(y, y_pred)
-
-def idec(dataset, save_dir):
+def dec(
+  dataset, 
+  save_dir, 
+  method=SymDEC.DEC,
+  pretrain_epochs=30,
+  batch_size=256,
+  gamma=0.1,
+  maxiter=2e4,
+  update_interval=50,
+  tol=0.001
+  ):
   """
-  Run IDEC
-
-  [1] https://github.com/XifengGuo/IDEC
+  Run deep embedding clustering method on the provided dataset. Pretrain 
+  autoencoder if there are no autoencoder weights in the resutls directory
   """
 
   x = dataset.data
@@ -261,43 +268,68 @@ def idec(dataset, save_dir):
     os.makedirs(save_dir)
 
   ae_weights = save_dir + '/ae_weights.h5'
-  n_clusters = np.max(y) + 1
-  batch_size = 256
+  n_clusters = get_num_clusters(y)
+  
   init = VarianceScaling(scale=1. / 3., mode='fan_in',
     distribution='uniform')  # [-limit, limit], limit=sqrt(1./fan_in)
-    
+
   # Pretrain autoencoder
   if not os.path.exists(ae_weights):
     pretrain_optimizer = SGD(lr=1, momentum=0.9)
-    pretrain_epochs = 30
+    
     dec = DEC.DEC(
       dims=[x.shape[-1], 500, 500, 2000, 10], n_clusters=n_clusters, init=init)
     dec.pretrain(x=x, y=y, optimizer=pretrain_optimizer, epochs=pretrain_epochs,
       batch_size=batch_size, save_dir=save_dir)
 
-  # Run IDEC
+  # Prepare model and perform clustering
   optimizer = SGD(lr=0.1, momentum=0.99)
-  gamma = 0.1
-  maxiter = 2e4
-  update_interval = 50 
-  tol = 0.005
-  
-  # prepare the IDEC model
-  idec = IDEC.IDEC(dims=[x.shape[-1], 500, 500, 2000, 10], n_clusters=n_clusters, batch_size=batch_size)
-  idec.initialize_model(ae_weights=ae_weights, gamma=gamma, optimizer=optimizer)
-  idec.model.summary()
+  if method == IDEC.IDEC:
+    dec = method(dims=[x.shape[-1], 500, 500, 2000, 10], 
+      n_clusters=n_clusters, batch_size=batch_size)
+    dec.initialize_model(
+      ae_weights=ae_weights, gamma=gamma, optimizer=optimizer)
+    dec.model.summary()
 
-  # begin clustering, time not include pretraining part.
-  t0 = time.time()
-  y_pred = idec.clustering(
-    x, y=y, tol=tol, maxiter=maxiter, update_interval=update_interval, 
-    save_dir=save_dir)
-  
-  accuracy = IDEC_DEC.cluster_acc(y, y_pred)
-  print ('acc:', accuracy)
+    t0 = time.time()
+    y_pred = dec.clustering(x, y=y, tol=tol, maxiter=maxiter,
+      update_interval=update_interval, save_dir=save_dir)
+  else:
+    dec = method(dims=[x.shape[-1], 500, 500, 2000, 10], 
+      n_clusters=n_clusters, init=init)
+    dec.autoencoder.load_weights(ae_weights)
+    dec.model.summary()
+
+    t0 = time.time()
+    dec.compile(optimizer=optimizer, loss='kld')
+    y_pred = dec.fit(x, y=y, tol=tol, maxiter=maxiter, batch_size=batch_size, 
+      update_interval=update_interval, save_dir=save_dir)
+
+  acc = unsupervised_accuracy(y, y_pred)
+  nmi = metrics.normalized_mutual_info_score(y, y_pred)
+  ari = metrics.adjusted_rand_score(y, y_pred)
+  fscore = metrics.f1_score(y, y_pred, average='micro')
+
+  print ('\nacc: ', acc)
   print ('clustering time: ', (time.time() - t0))
 
-  return accuracy, metrics.nmi(y, y_pred), metrics.ari(y, y_pred)
+  return acc, nmi, ari, fscore
+
+def gelu(x):
+  """
+  Activation function from https://github.com/google-research/bert
+
+  Gaussian Error Linear Unit.
+  This is a smoother version of the RELU.
+  Original paper: https://arxiv.org/abs/1606.08415
+  Args:
+    x: float Tensor to perform activation.
+  Returns:
+    `x` with the GELU activation applied.
+  """
+  cdf = 0.5 * (1.0 + tf.tanh(
+      (np.sqrt(2 / np.pi) * (x + 0.044715 * tf.pow(x, 3)))))
+  return x * cdf
 
 class brnn(object):
   """
@@ -309,26 +341,41 @@ class brnn(object):
   def __init__(self):
     self.MODEL_DIR     = 'models/rnn_model'
     self.BATCH_SIZE    = 128
-    self.LEARNING_RATE = 1e-3
-    self.ITERATIONS    = 10000    
+    self.LEARNING_RATE = 1e-4
+    self.ITERATIONS    = 60000    
     self.HIDDEN_UNITS  = 32
     self.NUM_CLASSES   = 2
+    self.CELL          = 'GRU'
+    self.ACTIVATION    = tf.nn.tanh
 
   def bidirectional_rnn(self, input_layer):
     """
     Bidirectional RNN in tensorflow
     """
-    
-    forward_cell = tf.contrib.rnn.GRUCell(
-      num_units=self.HIDDEN_UNITS,
-      activation=tf.nn.tanh,
-      kernel_initializer=tf.contrib.layers.xavier_initializer(),
-      )
-    backward_cell = tf.contrib.rnn.GRUCell(
-      num_units=self.HIDDEN_UNITS,
-      activation=tf.nn.tanh,
-      kernel_initializer=tf.contrib.layers.xavier_initializer(),
-      )
+    if self.CELL == 'GRU':
+      forward_cell = tf.contrib.rnn.GRUCell(
+        num_units=self.HIDDEN_UNITS,
+        activation=self.ACTIVATION,
+        kernel_initializer=tf.contrib.layers.xavier_initializer(),
+        )
+      backward_cell = tf.contrib.rnn.GRUCell(
+        num_units=self.HIDDEN_UNITS,
+        activation=self.ACTIVATION,
+        kernel_initializer=tf.contrib.layers.xavier_initializer(),
+        )
+    elif self.CELL == 'LSTM':
+      forward_cell = tf.contrib.rnn.LSTMCell(
+        num_units=self.HIDDEN_UNITS,
+        use_peepholes = True,
+        initializer=tf.contrib.layers.xavier_initializer(),
+        activation=self.ACTIVATION
+        )
+      backward_cell = tf.contrib.rnn.LSTMCell(
+        num_units=self.HIDDEN_UNITS,
+        use_peepholes = True,
+        initializer=tf.contrib.layers.xavier_initializer(),
+        activation=self.ACTIVATION
+        )
 
     rnn_outputs, output_state_fw, output_state_bw = \
       tf.nn.static_bidirectional_rnn(
@@ -356,13 +403,18 @@ class brnn(object):
     context = tf.matmul(expanded_alignments, attention_mechanism.values)
     context = tf.squeeze(context, [1])
 
-    output_attention = tf.concat(
-      [context, output_state_fw, output_state_bw], 1)
+    if self.CELL == 'LSTM': 
+      # LSTM state is a tuple (c, h) by default
+      output_attention = tf.concat(
+        [context, output_state_fw[0], output_state_bw[0]], 1)
+    else:
+      output_attention = tf.concat(
+        [context, output_state_fw, output_state_bw], 1)
 
     output_state = tf.layers.dense(
       inputs=output_attention, 
       units=4*self.HIDDEN_UNITS, 
-      activation=tf.nn.tanh,
+      activation=self.ACTIVATION,
       use_bias=True, 
       kernel_initializer=tf.contrib.layers.xavier_initializer(),
       )
@@ -374,12 +426,11 @@ class brnn(object):
     Instantiate a RNN and setup the model for training and inference
     """
     input_layer = tf.unstack(features["data"], axis=2)
-    print(np.asarray(input_layer).shape)
     output_state, alignments = self.bidirectional_rnn(input_layer)
 
     # Classification layer
     output_state = tf.layers.dropout(
-      inputs=output_state, rate=0.5, training=mode==tf.estimator.ModeKeys.TRAIN)
+      inputs=output_state, rate=0.3, training=mode==tf.estimator.ModeKeys.TRAIN)
     output = tf.layers.dense(
       inputs=output_state, 
       units=self.NUM_CLASSES, 
@@ -406,8 +457,11 @@ class brnn(object):
 
     # Training operation
     if mode == tf.estimator.ModeKeys.TRAIN:
+      global_step = tf.train.get_global_step()
+      lrate = tf.train.exponential_decay(self.LEARNING_RATE,
+        global_step, 1000, 0.96, staircase=True)
       optimizer = tf.train.AdamOptimizer( 
-        learning_rate=self.LEARNING_RATE,
+        learning_rate=lrate,
         beta1=0.9,
         beta2=0.999,
         epsilon=1e-08
@@ -436,9 +490,6 @@ class brnn(object):
     Run training procedure and test the model using dataset
     """
     train_data, test_data, train_labels, test_labels = dataset.split_dataset()
-    length  = len(train_data[0])
-    train_data = train_data.reshape([-1, 1, length])
-    test_data  = test_data .reshape([-1, 1, length])
     
     # Clean model directory
     if os.path.isfile(self.MODEL_DIR + '/checkpoint'):
@@ -483,5 +534,104 @@ class brnn(object):
       )
     experiment.continuous_train_and_eval()  
 
+  def crossval(self, dataset, train_eval_runs=1):
+    """
+    Cross validation for the BRNN
+    """
+    
+    accs, pres, recs, fscs = [], [], [], []
+
+    for k in range(dataset.k):
+      time.sleep(60)
+      dataset.next_fold()
+      train_data    = dataset.train_data        
+      train_labels  = dataset.train_labels 
+      test_data     = dataset.test_data         
+      test_labels   = dataset.test_labels  
+
+      # Clean model directory
+      if os.path.isfile(self.MODEL_DIR + '/checkpoint'):
+        os.remove(self.MODEL_DIR + '/checkpoint')
+      for model_file in glob.glob('/'.join([self.MODEL_DIR, 'model.ckpt*'])):
+        os.remove(model_file)
+
+      # Configure GPU memory usage
+      config = tf.ConfigProto()
+      config.gpu_options.allow_growth = True
+
+      # Estimator
+      classifier = tf.estimator.Estimator(
+        model_fn=self.rnn_model_fn, 
+        model_dir=self.MODEL_DIR, 
+        config=tf.contrib.learn.RunConfig(
+          tf_random_seed=43,save_checkpoints_secs=120*60,session_config=config))
+      
+      # Train the model computing  metrics over the test set
+      train_input_fn = tf.estimator.inputs.numpy_input_fn(
+        x={"data": train_data},
+        y=train_labels,
+        batch_size=self.BATCH_SIZE,
+        num_epochs=None, # Continue until training steps are finished
+        shuffle=True
+        )
+      test_input_fn = tf.estimator.inputs.numpy_input_fn(
+        x={"data": test_data},
+        y=test_labels,
+        batch_size=self.BATCH_SIZE,
+        num_epochs=1, 
+        shuffle=False
+        )
+
+      if k >= train_eval_runs:
+        classifier.train(
+          input_fn=train_input_fn,
+          max_steps=self.ITERATIONS
+          )
+      else:
+        experiment = tf.contrib.learn.Experiment(
+          estimator=classifier,
+          train_input_fn=train_input_fn,
+          eval_input_fn=test_input_fn,
+          train_steps=self.ITERATIONS,
+          eval_steps=None, # evaluate runs until input is exhausted
+          eval_delay_secs=120, 
+          train_steps_per_iteration=1000
+          )
+        experiment.continuous_train_and_eval() 
+
+      # Test the model and print results
+      test_results = classifier.evaluate(input_fn=test_input_fn)
+      
+      # Compute model metrics with Scikit learn
+      predict_labels = []
+      predict_results = classifier.predict(input_fn=test_input_fn)
+      for prediction in predict_results:
+        predict_labels.append(prediction['labels'])
+      predict_labels = np.asarray(predict_labels)
+      
+      acc = test_results['accuracy' ] # Tensorflow
+      pre =  metrics.precision_score(
+        test_labels, predict_labels, average='weighted')
+      rec =  metrics.recall_score(
+        test_labels, predict_labels, average='weighted')
+      fsc = metrics.f1_score(test_labels, predict_labels, average='weighted')
+      accs.append(acc); pres.append(pre); recs.append(rec); fscs.append(fsc)
+
+      print("\nCross validation k = %d accuracy = %.5f\n" % (k, acc))
+      print(accs); print(pres); print(recs); print(fscs)
+    
+    print("\n\nTest results\n")
+    print('\tacc: mean = %.5f  stdev = %.5f' % (np.mean(accs), np.std(accs))) 
+    print('\tpre: mean = %.5f  stdev = %.5f' % (np.mean(pres), np.std(pres))) 
+    print('\trec: mean = %.5f  stdev = %.5f' % (np.mean(recs), np.std(recs))) 
+    print('\tfsc: mean = %.5f  stdev = %.5f' % (np.mean(fscs), np.std(fscs))) 
+    print(accs); print(pres); print(recs);  print(fscs)
+
 if __name__ == "__main__":
   print('Methods module')
+
+  print('\n\n--- Experiment with reuters dataset')
+  reuters = datasets.reuters()
+  reuters.load()
+  
+  aglomerative_clustering(reuters.data, reuters.labels)
