@@ -5,13 +5,19 @@ Sesarch session segmentation using a number of methods
 import datasets, time, DEC, IDEC, SymDEC
 
 import numpy as np
+import networkx as nx
 from sklearn import metrics
 from sklearn.cluster import KMeans, DBSCAN, AgglomerativeClustering
 from sklearn.utils.linear_assignment_ import linear_assignment
 from keras.optimizers import SGD
 from keras.initializers import VarianceScaling
 
+from sklearn.cluster import k_means_
+from scipy.spatial.distance import cosine
+from sklearn.preprocessing import StandardScaler
+
 import os, gc, time, shutil, glob
+from distutils.dir_util import copy_tree
 
 import numpy as np
 import tensorflow as tf
@@ -31,62 +37,91 @@ def unsupervised_accuracy(true_labels, predicted_labels):
     predicted_labels = np.asarray(predicted_labels)
 
     n_labels = predicted_labels.size
-    n_clusters = get_num_clusters(true_labels)
+    n_clusters = max(
+      get_num_clusters(true_labels), get_num_clusters(predicted_labels)) + 1
     weights = np.zeros((n_clusters, n_clusters), dtype=np.int64)
 
     for i in range(n_labels):
-        weights[predicted_labels[i], true_labels[i]] += 1
+      weights[predicted_labels[i], true_labels[i]] += 1
     
     indices = linear_assignment(weights.max() - weights)
     accuracy = float(sum([weights[i, j] for i, j in indices])) / n_labels
     return accuracy
 
 def pairwise_counts(true_labels, predicted_labels):
-  f00, f01, f10, f11 = 0.0, 0.0, 0.0, 0.0
+  tn, fn, fp, tp = 0.0, 0.0, 0.0, 0.0
 
   assert(len(true_labels) == len(predicted_labels))
 
   for i in range(0, len(true_labels) - 1):
     for j in range(i + 1, len(true_labels)):
       if true_labels[i] == true_labels[j] and predicted_labels[i] == predicted_labels[j]:
-        f11 += 1.0
+        tp += 1.0 
       elif true_labels[i] != true_labels[j] and predicted_labels[i] != predicted_labels[j]:
-        f00 += 1.0
+        tn += 1.0 
       elif true_labels[i] == true_labels[j] and predicted_labels[i] != predicted_labels[j]:
-        f01 += 1.0
+        fn += 1.0 
       elif true_labels[i] != true_labels[j] and predicted_labels[i] == predicted_labels[j]:
-        f10 += 1.0
+        fp += 1.0 
     
-  return f00, f01, f10, f11
+  return tn, fn, fp, tp
 
 def rand_index(true_labels, predicted_labels):
-  f00, f01, f10, f11 = pairwise_counts(true_labels, predicted_labels)
-  return (f00 + f11) / (f00 + f01 + f10 + f11 + 1e-10)
+  tn, fn, fp, tp = pairwise_counts(true_labels, predicted_labels)
+  return (tn + tp) / (tn + fn + fp + tp + 1e-10)
 
 def jaccard_index(true_labels, predicted_labels):
-  _, f01, f10, f11 = pairwise_counts(true_labels, predicted_labels)
-  return f11 / (f01 + f10 + f11 + 1e-10)
+  _, fn, fp, tp = pairwise_counts(true_labels, predicted_labels)
+  return tp / (fn + fp + tp + 1e-10)
+
+def pairwise_fscore(true_labels, predicted_labels):
+  _, fn, fp, tp = pairwise_counts(true_labels, predicted_labels)
+
+  precision = tp / (tp + fp + 1e-10)
+  recall = tp / (tp + fn + 1e-10)
+  pairwise_fscore = 2 * precision * recall / (precision + recall + 1e-10)
+
+  return pairwise_fscore, precision, recall
+
+def cs_recall(true_labels, predicted_labels, denominator=36768.0):
+  _, _, _, tp = pairwise_counts(true_labels, predicted_labels)
+  return tp / (denominator + 1e-10)
 
 def print_metrics(true_labels, predicted_labels):
   """ 
-  Command line output
+  Command line output for metrics
   """
 
-  print("\nMetrics: ")
+  print("Metrics: ")
   print("\tAccuracy: %0.5f" % unsupervised_accuracy(
     true_labels, predicted_labels))
   print("\tNormalized Mutal Info: %.5f" % metrics.normalized_mutual_info_score(
     true_labels, predicted_labels))
   print("\tAdjusted Rand Index: %.5f" % metrics.adjusted_rand_score(
     true_labels, predicted_labels))
-  print("\tFscore: %.5f" % metrics.f1_score(
-    true_labels, predicted_labels, average='weighted'))
+  print("\tRand Index: %.5f" % rand_index(
+    true_labels, predicted_labels))
+  print("\tJaccard Index: %.5f" % jaccard_index(
+    true_labels, predicted_labels))
   print("\tHomogeneity: %0.5f" % metrics.homogeneity_score(
     true_labels, predicted_labels))
   print("\tCompleteness: %0.5f" % metrics.completeness_score(
     true_labels, predicted_labels))
   print("\tV-measure: %0.5f" % metrics.v_measure_score(
     true_labels, predicted_labels))
+  print("\tFscore: %0.5f" % metrics.f1_score(
+    true_labels, predicted_labels, average='micro'))
+  print("\tPrecision: %0.5f" % metrics.precision_score(
+    true_labels, predicted_labels, average='micro'))
+  print("\tRecall: %0.5f" % metrics.recall_score(
+    true_labels, predicted_labels, average='micro'))
+
+  fscore, p, r = pairwise_fscore(true_labels, predicted_labels)
+  cs_r = cs_recall(true_labels, predicted_labels)
+  print("\tPairwise Fscore: %0.5f" % fscore)
+  print("\tPairwise Precision: %0.5f" % p)
+  print("\tPairwise Recall: %0.5f" % r)
+  print("\tPairwise CS Recall: %0.5f \n" % cs_r)  
 
 def get_num_clusters(labels):
   """ Compute the number of clusters from the dataset labels """
@@ -108,6 +143,30 @@ def kmeans(data, labels):
   km = KMeans(n_clusters=n_clusters)
   predicted_labels = km.fit_predict(data, labels)
 
+  print_metrics(labels, predicted_labels)
+  return predicted_labels
+
+def kmeans_cosine(data, labels):
+  """
+  Cluster data by running kmeans implementation in scikit-learn, but using
+  cosine similarity instead of euclidean distance 
+  
+  [1] https://gist.github.com/jaganadhg/b3f6af86ad99bf6e9bb7be21e5baa1b5
+  """
+
+  n_clusters = get_num_clusters(labels)
+  print("KMeans cosine. Number of clusters: " + str(n_clusters))
+
+  def cosine_dist(X, Y = None, Y_norm_squared = None, squared = False):
+    return cosine(X, Y)
+
+  k_means_.euclidean_distances = cosine_dist
+  scaler = StandardScaler(with_mean=False)
+  sparse_data = scaler.fit_transform(data)
+  kmeans = k_means_.KMeans(n_clusters=n_clusters, n_jobs=20, random_state = 43)
+  kmeans.fit(sparse_data)
+  predicted_labels = kmeans.labels_
+  
   print_metrics(labels, predicted_labels)
   return predicted_labels
 
@@ -209,7 +268,7 @@ def decs(
   batch_size=256,
   gamma=0.1,
   maxiter=2e4,
-  update_interval=50,
+  update_interval=30,
   tol=0.001
   ):
   """
@@ -308,12 +367,126 @@ def dec(
   acc = unsupervised_accuracy(y, y_pred)
   nmi = metrics.normalized_mutual_info_score(y, y_pred)
   ari = metrics.adjusted_rand_score(y, y_pred)
-  fscore = metrics.f1_score(y, y_pred, average='micro')
+  fscore, _, _ = pairwise_fscore(y, y_pred)
 
   print ('\nacc: ', acc)
   print ('clustering time: ', (time.time() - t0))
 
   return acc, nmi, ari, fscore
+
+class qcwcc(object):
+  """
+  Clustering method based on graphs. It gives the best results for task session
+  identification in (Lucchese et al., 2011)
+  """
+  def __init__(self, data, labels, threshold=0.7, alpha=0.5, 
+    representation=datasets.representation().word2vec, 
+    semantic=datasets.clueweb().semantic_similarity):
+    self.data = data
+    self.labels = labels
+    self.threshold = threshold
+    self.alpha = alpha
+    self.graph = nx.Graph()
+    self.predicted_labels = None
+
+    self.compute_representation = representation
+    self.compute_semantic = semantic
+
+  def query_similarity(self, q0, q1):
+    """
+    Compute similarity between the word embeddings representing queries. Use 
+    cosine distance for lexical relatedness and cluweb for semantic relatedness
+    """
+    lexical = self.compute_representation([q0, q1])
+    lexical_sim = 1 - cosine(lexical[0], lexical[1])
+    semantic_sim = self.compute_semantic(q0, q1)
+    sim = self.alpha * lexical_sim + (1 - self.alpha) * semantic_sim
+    return sim
+
+  def build_graph(self):
+    """
+    Use query indexes as nodes and query distances as weights
+    """
+    assert isinstance(self.data[0], str)
+
+    for i in range(len(self.data) - 1):
+      for j in range(i+1, len(self.data)):
+        weight = self.query_similarity(self.data[i], self.data[j])
+        self.graph.add_edge(i, j, weight=weight)
+      print('\tbuilding graph %d'%(i))
+
+  def prune_graph(self):
+    """
+    Use threshold to discard edges with queries too distant apart
+    """
+    weak_edges = []
+    for u, v, weight in self.graph.edges.data('weight'): 
+      if weight < self.threshold or np.isnan(weight):
+        weak_edges.append((u, v)) 
+    self.graph.remove_edges_from(weak_edges)
+
+  def label_queries(self):
+    """
+    Use connected components in the pruned graph to detect clusters and label
+    queries accordingly
+    """
+    cluster = 0
+    predicted_labels = np.zeros(self.labels.shape)
+    for component in nx.connected_components(self.graph):
+      for idx in component:
+        predicted_labels[idx] = cluster
+      cluster += 1
+    self.predicted_labels = np.asarray(predicted_labels, dtype=np.int32)
+
+  def cluster(self):
+    """
+    Run QC_WCC graph based method for queries clustering
+    """
+    self.build_graph()
+    self.prune_graph()
+    self.label_queries()
+
+    print('QC WCC threshold %.2f alpha %.2f'%(self.threshold, self.alpha))
+    print_metrics(self.labels, self.predicted_labels)
+    return self.predicted_labels
+
+def qcwcc_time_session(dataset, threshold=0.7, alpha=0.5):
+  """
+  Perform clustering using the 26 minutes time gap session in Lucchese et al., 
+  2011. Use a dataset with both Lucchese et al., 2011 labels and Sen et al., 
+  2018 cross session task labels
+  """
+
+  data, labels = [], []
+  fscores, weights, precisions, recalls = [], [], [], []
+  
+  for i in range(len(dataset.data) - 1):
+    data.append(dataset.data[i])
+    labels.append(dataset.cross_session_labels[i])
+
+    if dataset.time_ids[i+1] != dataset.time_ids[i]:
+      w = len(labels)
+      data = np.asarray(data, dtype=np.float32)
+      labels = np.asarray(labels, dtype=np.int32)
+      predicted_labels = qcwcc(
+        data, labels, threshold=threshold).cluster()
+
+      if w > 1:
+        fs, p, r = pairwise_fscore(labels, predicted_labels)
+        weights.append(w)
+        fscores.append(fs)
+        precisions.append(p)
+        recalls.append(r)
+
+      data, labels = [], []
+        
+  fscore = np.average(fscores, weights=weights)
+  precision = np.average(precisions, weights=weights)
+  recall = np.average(recalls, weights=weights)
+
+  print("\tSession Fscore: %0.5f" % fscore)
+  print("\tSession Precision: %0.5f" % precision)
+  print("\tSession Recall: %0.5f \n\n" % recall)
 
 def gelu(x):
   """
@@ -485,17 +658,19 @@ class brnn(object):
     return tf.estimator.EstimatorSpec(
       mode=mode, loss=loss, eval_metric_ops=eval_metric_ops)
 
-  def train_test(self, dataset):
+  def train_test(self, dataset, clean_model=True, test_size=0.3):
     """
     Run training procedure and test the model using dataset
     """
-    train_data, test_data, train_labels, test_labels = dataset.split_dataset()
+    train_data, test_data, train_labels, test_labels = dataset.split_dataset(
+      test_size=test_size)
     
     # Clean model directory
-    if os.path.isfile(self.MODEL_DIR + '/checkpoint'):
-      os.remove(self.MODEL_DIR + '/checkpoint')
-    for model_file in glob.glob('/'.join([self.MODEL_DIR, 'model.ckpt*'])):
-      os.remove(model_file)
+    if clean_model:
+      if os.path.isfile(self.MODEL_DIR + '/checkpoint'):
+        os.remove(self.MODEL_DIR + '/checkpoint')
+      for model_file in glob.glob('/'.join([self.MODEL_DIR, 'model.ckpt*'])):
+        os.remove(model_file)
     
     # Configure GPU memory usage
     config = tf.ConfigProto()
@@ -534,7 +709,8 @@ class brnn(object):
       )
     experiment.continuous_train_and_eval()  
 
-  def crossval(self, dataset, train_eval_runs=1):
+  def crossval(
+    self, dataset, train_eval_runs=1, transfer=False, pretrain_dir=''):
     """
     Cross validation for the BRNN
     """
@@ -554,6 +730,9 @@ class brnn(object):
         os.remove(self.MODEL_DIR + '/checkpoint')
       for model_file in glob.glob('/'.join([self.MODEL_DIR, 'model.ckpt*'])):
         os.remove(model_file)
+
+      if transfer == True:
+        copy_tree(pretrain_dir, self.MODEL_DIR)
 
       # Configure GPU memory usage
       config = tf.ConfigProto()
@@ -610,11 +789,9 @@ class brnn(object):
       predict_labels = np.asarray(predict_labels)
       
       acc = test_results['accuracy' ] # Tensorflow
-      pre =  metrics.precision_score(
-        test_labels, predict_labels, average='weighted')
-      rec =  metrics.recall_score(
-        test_labels, predict_labels, average='weighted')
-      fsc = metrics.f1_score(test_labels, predict_labels, average='weighted')
+      pre = test_results['precision']
+      rec = test_results['recall']
+      fsc = 2 * pre * rec / ( pre + rec )
       accs.append(acc); pres.append(pre); recs.append(rec); fscs.append(fsc)
 
       print("\nCross validation k = %d accuracy = %.5f\n" % (k, acc))
@@ -629,9 +806,3 @@ class brnn(object):
 
 if __name__ == "__main__":
   print('Methods module')
-
-  print('\n\n--- Experiment with reuters dataset')
-  reuters = datasets.reuters()
-  reuters.load()
-  
-  aglomerative_clustering(reuters.data, reuters.labels)

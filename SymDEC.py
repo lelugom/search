@@ -204,6 +204,7 @@ class DEC(object):
         t1 = time()
         print('Initializing cluster centers with k-means.')
         kmeans = KMeans(n_clusters=self.n_clusters, n_init=20)
+        print(np.asarray(self.encoder.predict(x)).shape)
         y_pred = kmeans.fit_predict(self.encoder.predict(x))
         y_pred_last = np.copy(y_pred)
         self.model.get_layer(name='clustering').set_weights([kmeans.cluster_centers_])

@@ -2,15 +2,20 @@
 Download datasets, uncompress, and store them under the datasets folder
 """
 
-import os, re, urllib, urllib.request, gzip, tarfile, zipfile, shutil
+import os, re, urllib, urllib.request, gzip, glob, tarfile, zipfile, shutil
 
 # Constants
 DATA_DIR = "datasets"
 
+AOL_LEAK = 'https://archive.org/download/AOL_search_data_leak_2006/AOL_search_data_leak_2006.zip'
 AOL_LUCCHESE = "http://miles.isti.cnr.it/~tolomei/?download=aol-task-ground-truth.tar.gz"
 AOL_PROCHETA = "https://raw.githubusercontent.com/procheta/AOLTaskExtraction/master/Task.csv"
 AOL_GAYO_AVELLO = "http://www.uni-weimar.de/medien/webis/corpora/corpus-webis-smc-12/corpus-webis-smc-12.zip"
-SOGOUQ = "https://www.sogou.com/labs/resource/ftp.php?dir=/Data/SogouQ/SogouQ.tar.gz"
+
+# Only the lite version is available for download 
+# (http://www.sogou.com/labs/resource/q.php). Use GBK encoding instead of UTF-8 
+# to properly see characters
+SOGOUQ = 'http://download.labs.sogou.com/dl/sogoulabdown/SogouQ/SogouQ.reduced.zip'
 
 REUTERS10K = "http://www.ai.mit.edu/projects/jmlr/papers/volume5/lewis04a/"
 REUTERS10K_FILES = [
@@ -24,6 +29,7 @@ REUTERS10K_FILES = [
 
 GLOVE = "http://nlp.stanford.edu/data/glove.42B.300d.zip"
 FASTTEXT_EN = "https://dl.fbaipublicfiles.com/fasttext/vectors-crawl/cc.en.300.bin.gz"
+FASTTEXT_CH = "https://dl.fbaipublicfiles.com/fasttext/vectors-crawl/cc.zh.300.bin.gz"
 # Manual download from Google Drive
 WORD2VEC_EN = "https://drive.google.com/uc?export=download&confirm=YjKc&id=0B7XkCwpI5KDYNlNUTTlSS21pQmM"
 
@@ -62,11 +68,32 @@ def download_file(folder, filename, url):
 
   uncompress(folder, file)
 
+def consolidate_aol_leak():
+  """
+  After downloading and decompressing file dataset file, clean aol directory,
+  decompress collection zip files and consolidate all the txts into a single
+  file
+
+  [1] https://stackoverflow.com/questions/17749484/python-script-to-concatenate-all-the-files-in-the-directory-into-one-file
+  """
+  folder = '/'.join([DATA_DIR, 'aol', 'AOL-user-ct-collection'])
+  if os.path.isdir('/'.join([DATA_DIR, 'aol', '__MACOSX'])):
+    shutil.rmtree('/'.join([DATA_DIR, 'aol', '__MACOSX']))
+  
+  outfilename = folder + '/user-ct-test-collection.txt'
+  with open(outfilename, 'wb') as outfile:
+    for filename in sorted(glob.glob(folder + '/*.gz')):
+      uncompress('', filename)
+      with open(filename.replace('.txt.gz', '.txt'), 'rb') as readfile:
+        shutil.copyfileobj(readfile, outfile)
+
 def download_files():
   """
   Download text datasets 
   """
 
+  download_file(
+    '/'.join([DATA_DIR, "aol"]), "AOL_search_data_leak_2006.zip", AOL_LEAK)
   download_file(
     '/'.join([DATA_DIR, "aol"]), "aol-task-ground-truth.tar.gz", AOL_LUCCHESE)
   download_file(
@@ -74,7 +101,11 @@ def download_files():
   download_file(
     '/'.join([DATA_DIR, "aol"]), "corpus-webis-smc-12.zip", AOL_GAYO_AVELLO)
   download_file(
+    '/'.join([DATA_DIR, "sogouq"]), "SogouQ.reduced.zip", SOGOUQ)
+  download_file(
     '/'.join([DATA_DIR, "fasttext"]), "cc.en.300.bin.gz", FASTTEXT_EN)
+  download_file(
+    '/'.join([DATA_DIR, "fasttext"]), "cc.zh.300.bin.gz", FASTTEXT_CH)
   download_file(
     '/'.join([DATA_DIR, "word2vec"]), "GoogleNews-vectors-negative300.bin.gz", 
     WORD2VEC_EN)
@@ -84,6 +115,8 @@ def download_files():
   for url in REUTERS10K_FILES:
     filename = os.path.basename(url)
     download_file('/'.join([DATA_DIR, "reuters"]), filename, url)
+
+  consolidate_aol_leak()
 
 if __name__ == "__main__":
   download_files()
