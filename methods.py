@@ -169,7 +169,7 @@ class mgbc(object):
 
     fscore, _, _ = pairwise_fscore(self.labels, self.predicted_labels)
     print('\nthreshold %.2f alpha %.2f fscore %.3f'%(
-      self.threshold, self.alpha, fscore))
+      -self.threshold, self.alpha, fscore))
 
 class brnn(object):
   """
@@ -733,7 +733,7 @@ class task_map(object):
     self.runs = 50
     self.annoy_metric = 'angular'
     self.annoy_n = 1
-    self.ngt_distance = 'L2'
+    self.ngt_distance = 'Normalized Angle'
 
   def ngt_predict(self, model, test_data, train_labels):
     """
