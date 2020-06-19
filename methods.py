@@ -732,7 +732,7 @@ class task_map(object):
     self.test_time_ms = None
     self.runs = 50
     self.annoy_metric = 'angular'
-    self.annoy_n = 1
+    self.annoy_n = 9
     self.ngt_distance = 'Normalized Angle'
 
   def ngt_predict(self, model, test_data, train_labels):

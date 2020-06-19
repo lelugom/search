@@ -94,3 +94,6 @@ python3 experiments.py -t identification -u clueweb_url
   year={2020}
 }
 ```
+
+### License
+This project is licensed under the terms of the [MIT](https://opensource.org/licenses/MIT) license.

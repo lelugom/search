@@ -212,7 +212,7 @@ def task_seg_ml_sklearn_crossval():
   print('\n\n--- Experiment with Sen et al. dataset ')
   sen_aol = datasets.lucchese_aol(
     representation=datasets.representation().glove)
-  sen_aol.load_sequential_pair()
+  sen_aol.load_sequential_queries()
   classifiers.run(sen_aol)
 
   dataset = datasets.lucchese_aol()
@@ -222,7 +222,7 @@ def task_seg_ml_sklearn_crossval():
   print('\n\n--- Experiment with Hagen et al. dataset ')
   hagen_aol = datasets.hagen_aol(
     representation=datasets.representation().glove)
-  hagen_aol.load_sequential_queries(m=0, n=1)
+  hagen_aol.load_sequential_queries()
   classifiers.run(hagen_aol)
   
   dataset = datasets.hagen_aol()
