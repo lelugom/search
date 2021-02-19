@@ -5,14 +5,18 @@ representation
 
 import download_datasets
 
-import io, csv, gc, os, sys, distance, json
+import io, csv, gc, os, sys, distance, json, time
 import re, urllib.request, urllib.parse
 from datetime import timezone, datetime
 
 import tensorflow_hub as hub
 import tensorflow as tf
 import numpy as np 
-import tf_sentencepiece
+if tf.__version__.startswith('2.'):
+  import scann
+  import bert
+else:
+  import tf_sentencepiece
 
 from gensim.models import KeyedVectors
 from gensim.test.utils import datapath
@@ -41,47 +45,55 @@ class representation(object):
     self.lang    = lang
     self.width   = width
 
+    self.max_seq_length = 32
+    self.query_list_step = 5000
+
+    self.cache_sep  = '|\t|\t|'
     self.muse_cache_file = download_datasets.DATA_DIR + '/muse/cache_muse.csv'
-    self.muse_cache_sep  = '\t|\t|\t|\t'
     self.muse_cache = {}
+    self.labse_cache_file = download_datasets.DATA_DIR+'/labse/cache_labse.csv'
+    self.labse_cache = {}
 
   def clear_cache(self):
     """
     Remove dictionaries for representation caches
     """
     self.muse_cache = {}
-    print('\tGC collect representation' + str(gc.collect()))
+    self.labse_cache = {}
 
-  def store_muse_cache(self):
+  def store_cache(self, cache_file, cache):
     """
     Store cache into local disk using a CSV file
     """
-    dir_path = os.path.dirname(self.muse_cache_file)
+    dir_path = os.path.dirname(cache_file)
     if not os.path.exists(dir_path):
       os.makedirs(dir_path)
 
-    with open(self.muse_cache_file, mode='w') as data_file:
-      for query in self.muse_cache:
-        embedding = [str(number) for number in self.muse_cache[query]]
+    with open(cache_file, mode='w', encoding='utf-8') as data_file:
+      for query in cache:
+        embedding = [str(number) for number in cache[query]]
         embedding = ','.join(embedding)
-        data_file.write(self.muse_cache_sep.join([query, embedding]) + '\n')
+        data_file.write(self.cache_sep.join([query, embedding]) + '\n')
         
-  def load_muse_cache(self):
+  def load_cache(self, cache_file, cache):
     """
-    Load CSV file from local disk and store query MUSE embeddings into cache 
+    Load CSV file from local disk and store query embeddings into cache 
     local variable
     """
-    if not os.path.exists(self.muse_cache_file):
+    if not os.path.exists(cache_file):
       return
 
-    print('\tLoading MUSE cache ' + self.muse_cache_file)
-    with open(self.muse_cache_file, mode='r') as data_file:
+    print('\tLoading cache ' + cache_file)
+    with open(cache_file, mode='r') as data_file:
       for line in data_file:
-        line = line.strip()
-        row = line.split(self.muse_cache_sep)
+        row = line.split(self.cache_sep)
         query = row[0]
-        embedding = [float(number) for number in row[1].split(',')]
-        self.muse_cache[query] = embedding
+        try :
+          embedding = [float(number) for number in row[1].split(',')]
+          cache[query] = embedding
+        except Exception as e:
+          print('\trow {} in cache {} does not have two fields, {}'.format(
+            str(row), cache_file, str(e)))
 
   def get_muse_vectors(self, queries):
     """
@@ -105,7 +117,7 @@ class representation(object):
     embeddings = self.session.run(muse)
     for i in range(len(queries)):
       self.muse_cache[queries[i]] = embeddings[i]
-    self.store_muse_cache()
+    self.store_cache(self.muse_cache_file, self.muse_cache)
     del muse
     return embeddings
 
@@ -123,7 +135,7 @@ class representation(object):
       self.vectors = hub.Module(download_datasets.M_UNIVERSAL_SENTENCE_ENCODER)
       self.session.run(tf.global_variables_initializer())
       self.session.run(tf.tables_initializer())
-      self.load_muse_cache()
+      self.load_cache(self.muse_cache_file, self.muse_cache)
 
     if isinstance(text_data[0], list):
       for queries in text_data:
@@ -136,7 +148,140 @@ class representation(object):
         embeddings.extend(muse_embeddings)
 
     return embeddings
+
+  def tokenize_queries(self, queries):
+    """
+    User BERT tokenizer to compute tokens for queries
+
+    [1] https://tfhub.dev/google/LaBSE/1
+    """
+    input_ids_all, input_mask_all, segment_ids_all = [], [], []
+    for input_string in queries:
+      input_tokens = \
+        ["[CLS]"] + self.tokenizer.tokenize(input_string) + ["[SEP]"]
+      input_ids = self.tokenizer.convert_tokens_to_ids(input_tokens)
+      sequence_length = min(len(input_ids), self.max_seq_length)
+
+      # Padding or truncation.
+      if len(input_ids) >= self.max_seq_length:
+        input_ids = input_ids[:self.max_seq_length]
+      else:
+        input_ids = input_ids + [0] * (self.max_seq_length - len(input_ids))
+
+      input_mask = \
+        [1] * sequence_length + [0] * (self.max_seq_length - sequence_length)
+
+      input_ids_all.append(input_ids)
+      input_mask_all.append(input_mask)
+      segment_ids_all.append([0] * self.max_seq_length)
+
+    return np.array(
+      input_ids_all), np.array(input_mask_all), np.array(segment_ids_all)
+
+  def load_labse_model(self):
+    """
+    Use tensorflow hub to load the pretrained LABSE model. After retrieving
+    resolved objects for vocab and do_lower_case, load the tokenizer using 
+    bert-for-tf2 bert module 
+
+    [1] https://tfhub.dev/google/LaBSE/1
+    """
+    if self.vectors == None:
+      labse_layer = hub.KerasLayer(
+        download_datasets.LANGUAGE_AGNOSTIC_SENTENCE_E, trainable=False)
+      input_word_ids = tf.keras.layers.Input(
+        shape=(self.max_seq_length,), dtype=tf.int32, name="input_word_ids")
+      input_mask = tf.keras.layers.Input(
+        shape=(self.max_seq_length,), dtype=tf.int32, name="input_mask")
+      segment_ids = tf.keras.layers.Input(
+        shape=(self.max_seq_length,), dtype=tf.int32, name="segment_ids")
+      pooled_output,  _ = labse_layer(
+        [input_word_ids, input_mask, segment_ids])
+      pooled_output = tf.keras.layers.Lambda(
+        lambda x: tf.nn.l2_normalize(x, axis=1))(pooled_output)
+      self.vectors = tf.keras.Model(
+        inputs=[input_word_ids, input_mask, segment_ids], outputs=pooled_output)
+
+      vocab_file = labse_layer.resolved_object.vocab_file.asset_path.numpy()
+      do_lower_case = labse_layer.resolved_object.do_lower_case.numpy()
+      self.tokenizer = \
+        bert.bert_tokenization.FullTokenizer(vocab_file, do_lower_case)
+
+  def get_labse_vectors(self, queries):
+    """
+    Load query embeddings from the LABSE cache. If any query is not stored 
+    there, load the LABSE model and update the cache
+    """
+    embeddings = []
+    update_cache = False
+     
+    for query in queries:
+      embedding = self.labse_cache.get(query, [])
+      if len(embedding) == 0:
+        update_cache = True
+        break
+      embeddings.append(embedding)
+
+    if update_cache == False:
+      return embeddings
+
+    self.load_labse_model()
+    input_ids, input_mask, segment_ids = self.tokenize_queries(queries)
+    input_ids   = tf.cast(input_ids, dtype=tf.int32)
+    input_mask  = tf.cast(input_mask, dtype=tf.int32)
+    segment_ids = tf.cast(segment_ids, dtype=tf.int32)
+    embeddings  = self.vectors([input_ids, input_mask, segment_ids])
+    embeddings  = np.asarray(embeddings, dtype=np.float32)
+    for i in range(len(queries)):
+      self.labse_cache[queries[i]] = embeddings[i]
+    self.store_cache(self.labse_cache_file, self.labse_cache)
+
+    return embeddings
+
+  def get_labse_vectors_nocache(self, queries):
+    """
+    Load the LABSE model and compute query vectors. Do not store information in
+    the cache.
+    """
+    embeddings = []
+    self.load_labse_model()
+
+    for index in range(0, len(queries), self.query_list_step):
+      input_ids, input_mask, segment_ids = self.tokenize_queries(
+        queries[index : index + self.query_list_step])
+      input_ids   = tf.cast(input_ids, dtype=tf.int32)
+      input_mask  = tf.cast(input_mask, dtype=tf.int32)
+      segment_ids = tf.cast(segment_ids, dtype=tf.int32)
+      labse_embeddings = self.vectors([input_ids, input_mask, segment_ids])
+      labse_embeddings = np.asarray(labse_embeddings, dtype=np.float32)
+      embeddings.extend(labse_embeddings)
+      
+    return embeddings
+
+  def labse(self, text_data):
+    """
+    Pretrained language agnostic BERT sentence embedding model
+
+    [1] https://ai.googleblog.com/2020/08/language-agnostic-bert-sentence.html
+    """
+    embeddings = []
+
+    if len(self.labse_cache) == 0:
+      self.load_cache(self.labse_cache_file, self.labse_cache)
+
+    if isinstance(text_data[0], list):
+      for queries in text_data:
+        labse_embeddings = self.get_labse_vectors(queries)
+        embeddings.append(labse_embeddings)
+    else:
+      for index in range(0, len(text_data), self.query_list_step):
+        labse_embeddings = self.get_labse_vectors(
+          text_data[index : index + self.query_list_step])
+        embeddings.extend(labse_embeddings)
+        print('\tcomputing LABSE encodings, index {}'.format(index), flush=True)
     
+    return embeddings
+
   def glove(self, text_data):
     """
     Pretrained word embeddings from GloVe
@@ -256,6 +401,162 @@ class representation(object):
       embeddings.append(embedding_array)
 
     return embeddings
+
+class orcas(object):
+  """
+  Open Resource for Click Analysis in Search
+
+  [1] https://microsoft.github.io/TREC-2020-Deep-Learning/ORCAS.html
+  """
+  def __init__(self, representation=representation().glove):
+    self.CACHE_FILE = download_datasets.DATA_DIR + '/orcas/cache_ids.csv'
+    self.CACHE_SEP  = '|\t|\t|'
+    self.doc_ids = {}
+    self.model = None
+    self.top_k = 1000
+    self.scann_leaves = 2000
+
+    self.tsv_file = '/'.join(
+      [download_datasets.DATA_DIR, 'orcas', 'orcas.tsv'])
+    self.tsv_queries = None
+    self.tsv_doc_ids = None
+    self.representation=representation
+
+  def load_cache(self):
+    """
+    Load TSV file from local disk and store query JSON results into cache 
+    local variable
+    """
+    if not os.path.exists(self.CACHE_FILE):
+      return
+
+    print('\tLoading Orcas cache ' + self.CACHE_FILE)
+    with open(self.CACHE_FILE, mode='r') as data_file:
+      for line in data_file:
+        row = line.split(self.CACHE_SEP)
+        if len(row) == 2:
+          self.doc_ids[row[0]] = row[1].split(',')
+        else:
+          print('\trow {} in cache {} does not have two fields'.format(
+            str(row), self.CACHE_FILE))
+
+  def save_cache(self):
+    """
+    Store cache into local disk using a CSV file
+    """
+    dir_path = os.path.dirname(self.CACHE_FILE)
+    if not os.path.exists(dir_path):
+      os.makedirs(dir_path)
+
+    with open(self.CACHE_FILE, mode='w') as data_file:
+      for query in self.doc_ids:
+        ids = ','.join(self.doc_ids[query])
+        data_file.write(self.CACHE_SEP.join([query, ids]) + '\n')
+
+  def load_tsv(self):
+    """
+    Load queries and document IDs form the ORCAS tsv file, encoding the queries
+    in the LABSE latent space with a local representation object
+    """
+    self.tsv_queries = []
+    self.tsv_doc_ids = []
+    with open(self.tsv_file, mode='r') as data_file:
+      reader = csv.reader(data_file, delimiter='\t')
+      for row in reader:
+        self.tsv_queries.append(row[1])
+        self.tsv_doc_ids.append(row[2])
+
+    encoding = representation()
+    encoding.query_list_step = 50000
+    encoding.labse_cache_file = \
+      download_datasets.DATA_DIR + '/labse/cache_orcas_labse.csv'
+    self.tsv_queries = encoding.labse(self.tsv_queries)
+    self.tsv_queries = np.asarray(self.tsv_queries, dtype=np.float32)
+
+  def retrieve(self, query):
+    """
+    Build an ORCAS index using ScaNN. Retrieve the top k document IDs in
+    the semantic space
+
+    [1] https://github.com/google-research/google-research/tree/master/scann
+    """
+    if self.model == None:
+      print('\tCreating Orcas ScaNN index ...')
+      self.load_tsv()
+      print('\n\tfinished query encoding', flush=True)
+      self.model = scann.ScannBuilder(
+        self.tsv_queries, self.top_k, 'dot_product').tree(
+        num_leaves=4000, 
+        num_leaves_to_search=self.scann_leaves, 
+        training_sample_size=1000000).score_ah(
+        dimensions_per_block=2, 
+        anisotropic_quantization_threshold=0.2).reorder(
+        reordering_num_neighbors=self.scann_leaves).create_pybind()
+      print('\tfinished Orcas ScaNN index', flush=True)
+
+    start = time.time()
+    encoded_query = self.representation([query])[0]
+    results, _ = self.model.search(
+      encoded_query, final_num_neighbors=self.top_k)
+    ids = []
+    for index in results:
+      ids.append(self.tsv_doc_ids[index])
+    print('\tquery: {} time: {}'.format(query, time.time() - start))
+
+    return ids
+
+  def retrieve_document_ids_cache(self, query):
+    """
+    Return an array of document ids retrieved from the ORCAS index. If the query
+    is not in the cache, load the whole index and update the cache
+    """
+    ids = self.doc_ids.get(query, [])
+    if ids != []:
+      return ids
+
+    ids = self.retrieve(query)
+    self.doc_ids[query] = ids
+    self.save_cache()
+    return ids
+
+  def retrieve_document_ids(self, query):
+    """
+    Return an array of document ids retrieved from the ORCAS index
+    """
+    ids = self.doc_ids.get(query, [])
+    if ids != []:
+      return ids
+
+    print('\tquery: {}, is not in the cache'.format(query))
+    return ids
+
+  def intent_similarity_ids(self, q0, q1):
+    """
+    Use the IDs from the top documents retrieved from ORCAS index to 
+    calculate the intent similarity
+
+    [1] AOLTaskExtraction/src/LucheseImplementation/SimScoreCalculation.java
+    """
+    if q0 == q1:
+      return 1.0
+    
+    if len(self.doc_ids) == 0:
+      self.load_cache()
+
+    q0_ids = self.retrieve_document_ids(q0)
+    q1_ids = self.retrieve_document_ids(q1)
+
+    initial_size = len(q0_ids)
+    for id in q1_ids:
+      if id in q0_ids:
+        q0_ids.remove(id)
+
+    intersec_size = initial_size - len(q0_ids)
+    if len(q0_ids) != 0 and len(q1_ids) != 0:
+      return float(intersec_size) / (
+        float(initial_size + len(q1_ids) - intersec_size))
+
+    return 0.0
 
 class clueweb(object):
   """
@@ -404,14 +705,22 @@ class csv_base_dataset():
     self.splits  = None
     
     self.delimiter     = ','
-    self.file_encoding = 'UTF-8'
+    self.file_encoding = 'utf8'
+    self.augmented_delimiter  = '|\t|\t|'
+    self.augmented_file = '/'.join(
+      [download_datasets.DATA_DIR, 'offline_back_translate.csv'])
+    self.aumgented_data = []
 
     self.compute_representation = representation
 
-  def load(self, textdata=False, prefix_title=None, data_idx=0, label_idx=1):
+  def load(
+    self, textdata=False, prefix_title=None, data_idx=0, label_idx=1, 
+    filter_idx=2, filter_set=None):
     """
     Load data into object variables according to the specified representation.
-    If textdata is True, do not compute any representation for the queries
+    If textdata is True, do not compute any representation for the queries. 
+    Use filter_idx field to ignore entries in the CSV with values in the 
+    filter_set
     """
     label_dict = {}
 
@@ -420,6 +729,8 @@ class csv_base_dataset():
       try:
         for row in reader:
           if prefix_title != None and row[0].startswith(prefix_title):
+            continue
+          if filter_set != None and row[filter_idx] in filter_set:
             continue
 
           text_label = row[label_idx]
@@ -433,15 +744,39 @@ class csv_base_dataset():
             query = query.replace('[', '').replace(']', '')
           self.data.append(query)
       except Exception as e:
-        print('Exception while loading dataset')
+        print('Exception while loading dataset ' + self.file)
         print('Loaded %d queries and %d labels \n%s'%(
           len(self.data), len(self.labels), e))
+        exit()
 
     self.labels = np.asarray(self.labels, dtype=np.int32)
     if textdata == False:
       self.data = self.compute_representation(self.data)
       self.data = np.asarray(self.data, dtype=np.float32)
-      print("Data size: " + str(self.data.shape))
+      print("\tData size: " + str(self.data.shape))
+
+  def load_augmented(self, textdata=False):
+    """
+    Use back tranlation offline dictionary to load augmented queries for queries
+    in self.data
+    """
+    augmentation = dict()
+    with open(
+      self.augmented_file, mode='r', encoding=self.file_encoding) as data_file:
+      for line in data_file:
+        row = line.strip().split(self.augmented_delimiter)
+        augmentation[row[0]] = row[1]
+
+    for query in self.data:
+      self.aumgented_data.append(augmentation.get(query, ''))
+
+    if textdata == False:
+      self.data = self.compute_representation(self.data)
+      self.data = np.asarray(self.data, dtype=np.float32)
+      self.aumgented_data = self.compute_representation(self.aumgented_data)
+      self.aumgented_data = np.asarray(self.aumgented_data, dtype=np.float32)
+      print("\tData size: " + str(self.data.shape))
+      print("\tData size augmented: " + str(self.aumgented_data.shape))
 
   def split_dataset(self, test_size=0.3):
     """
@@ -483,6 +818,23 @@ class volske_aol(csv_base_dataset):
     super().load(
       textdata=textdata, prefix_title='Query', data_idx=0, label_idx=2)
 
+  def load_filter_user(self, textdata=False):
+    """
+    Consider only users' queries, ignoring data augmentation entries from 
+    Google and Bing
+    """
+    super().load(
+      textdata=textdata, prefix_title='Query', data_idx=0, label_idx=2,
+      filter_idx=1, filter_set=set(['google', 'bing'])) 
+
+  def load_augmented_filter_user(self, textdata=False):
+    """
+    Consider only users' queries, ignoring data augmentation entries from 
+    Google and Bing
+    """
+    self.load_filter_user(textdata=True)
+    super().load_augmented(textdata=textdata)
+
 class volske_trek(csv_base_dataset):
   """
   Volske et al., 2019 dataset based on Trec
@@ -495,6 +847,23 @@ class volske_trek(csv_base_dataset):
   def load(self, textdata=False):
     super().load(
       textdata=textdata, prefix_title='Query', data_idx=0, label_idx=2)
+
+  def load_filter_user(self, textdata=False):
+    """
+    Consider only users' queries, ignoring data augmentation entries from 
+    Google and Bing
+    """
+    super().load(
+      textdata=textdata, prefix_title='Query', data_idx=0, label_idx=2,
+      filter_idx=1, filter_set=set(['google', 'bing'])) 
+
+  def load_augmented_filter_user(self, textdata=False):
+    """
+    Consider only users' queries, ignoring data augmentation entries from 
+    Google and Bing
+    """
+    self.load_filter_user(textdata=True)
+    super().load_augmented(textdata=textdata)
 
 class volske_wikihow(csv_base_dataset):
   """
@@ -509,6 +878,41 @@ class volske_wikihow(csv_base_dataset):
     super().load(
       textdata=textdata, prefix_title='Query', data_idx=0, label_idx=2)
 
+  def load_filter_user(self, textdata=False):
+    """
+    Consider only users' queries, ignoring data augmentation entries from 
+    Google and Bing
+    """
+    super().load(
+      textdata=textdata, prefix_title='Query', data_idx=0, label_idx=2,
+      filter_idx=1, filter_set=set(['google', 'bing'])) 
+
+  def load_augmented_filter_user(self, textdata=False):
+    """
+    Consider only users' queries, ignoring data augmentation entries from 
+    Google and Bing
+    """
+    self.load_filter_user(textdata=True)
+    super().load_augmented(textdata=textdata)
+
+class wp4_task(csv_base_dataset):
+  """
+  Search task dataset from Dosso et al., 2020
+  """
+  def __init__(self, representation=representation().glove):
+    super().__init__(representation)
+    self.delimiter = '\t'
+    self.file = '/'.join(
+      [download_datasets.DATA_DIR, 'wp4', 'wp4_tasks.csv'])
+
+  def load(self, textdata=False):
+    super().load(
+      textdata=textdata, prefix_title=None, data_idx=0, label_idx=1)
+
+  def load_augmented(self, textdata=False):
+    self.load(textdata=True)
+    super().load_augmented(textdata=textdata)
+    
 class sen_aol(csv_base_dataset):
   """
   Search session task dataset from (Sen et al., 2018)
@@ -521,6 +925,10 @@ class sen_aol(csv_base_dataset):
   def load(self, textdata=False):
     super().load(
       textdata=textdata, prefix_title=None, data_idx=0, label_idx=1)
+
+  def load_augmented(self, textdata=False):
+    self.load(textdata=True)
+    super().load_augmented(textdata=textdata)
 
   def save_additional_info(self):
     """ 
@@ -944,6 +1352,74 @@ class hagen_aol(object):
 
     print('Entry shape: ' + str(np.asarray(self.data[0]).shape))
     print('Data shape:  ' + str(np.asarray(self.data).shape))
+
+  def load_sequential_pair_dual(self):
+    """
+    Load data in sequential pairs of queries, tagging with a one
+    when there is a task change, zero otherwise. Instead of using one vector 
+    per query, use multiple embeddings, loading the queries separetely into 
+    left and right arrays
+    """
+
+    self.read_csv()
+
+    left_queries, right_queries, tags, gaps = [], [], [], []
+    for i in range(len(self.data) - 1):
+      left_queries.append(self.data[i])
+      right_queries.append(self.data[i+1])
+      tdelta = self.timestamps[i] - self.timestamps[i+1]
+      gaps.append(float(abs(tdelta.total_seconds())))
+      if self.labels[i] == self.labels[i+1]:
+        tags.append(0)
+      else:
+        tags.append(1)
+
+    self.data_left = self.compute_representation(left_queries)
+    self.data_right = self.compute_representation(right_queries)
+    self.labels = tags
+    self.data_left = np.asarray(self.data_left, dtype=np.float32)
+    self.data_right = np.asarray(self.data_left, dtype=np.float32)
+    self.labels = np.asarray(self.labels, dtype=np.int32)
+
+    print('Entry shape: ' + str(self.data_left[0].shape) \
+      + ' ' + str(self.data_right[0].shape))
+    print('Data shape:  ' + str(self.data_left.shape) \
+      + ' ' + str(self.data_right.shape))
+
+  def load_random_pair_dual(self):
+    """
+    Load data in pairs of queries, tagging with a one when they are sequential, 
+    zero otherwise. Instead of using one vector per query, use multiple 
+    embeddings, loading the queries separately into left and right arrays
+    """
+
+    self.read_csv()
+
+    left_queries, right_queries, tags, gaps = [], [], [], []
+    for i in range(len(self.data) - 1):
+      left_queries.append(self.data[i])
+      right_queries.append(self.data[i+1])
+      tags.append(1)
+
+    for i in range(len(self.data) - 1):
+      idxs =  np.random.randint(len(self.data), size=2)
+      while np.abs(idxs[0] - idxs[1]) == 1:
+        idxs =  np.random.randint(len(self.data), size=2)
+      left_queries.append(self.data[idxs[0]])
+      right_queries.append(self.data[idxs[1]])
+      tags.append(0)
+
+    self.data_left = self.compute_representation(left_queries)
+    self.data_right = self.compute_representation(right_queries)
+    self.labels = tags
+    self.data_left = np.asarray(self.data_left, dtype=np.float32)
+    self.data_right = np.asarray(self.data_left, dtype=np.float32)
+    self.labels = np.asarray(self.labels, dtype=np.int32)
+
+    print('Entry shape: ' + str(self.data_left[0].shape) \
+      + ' ' + str(self.data_right[0].shape))
+    print('Data shape:  ' + str(self.data_left.shape) \
+      + ' ' + str(self.data_right.shape))
 
   def load_sequential_queries(self, m=0, n=1):
     """

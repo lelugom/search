@@ -2,7 +2,7 @@
 Sesarch session segmentation using a number of methods
 """
 
-import download_datasets, datasets
+import download_datasets, datasets, deep_clustering
 
 import os, gc, time, shutil, glob, copy, distance, multiprocessing
 import ngtpy
@@ -11,9 +11,11 @@ from distutils.dir_util import copy_tree
 import numpy as np
 import tensorflow as tf
 import networkx as nx
+if tf.__version__.startswith('2.'):
+  import scann
 
 from tensorflow.keras.optimizers import SGD, Adam
-from keras.initializers import VarianceScaling
+from tensorflow.keras.initializers import VarianceScaling
 from scipy.spatial.distance import cosine
 
 from sklearn import metrics
@@ -31,8 +33,7 @@ from sklearn.ensemble import RandomForestClassifier, AdaBoostClassifier
 from sklearn.naive_bayes import GaussianNB
 from sklearn.discriminant_analysis import QuadraticDiscriminantAnalysis
 
-# Random seed and TF logging
-tf.logging.set_verbosity(tf.logging.INFO)
+# Random seed 
 np.random.seed(43)
 
 def unsupervised_accuracy(true_labels, predicted_labels):
@@ -59,7 +60,6 @@ def unsupervised_accuracy(true_labels, predicted_labels):
 
 def pairwise_counts(true_labels, predicted_labels):
   tn, fn, fp, tp = 0.0, 0.0, 0.0, 0.0
-
   assert(len(true_labels) == len(predicted_labels))
 
   for i in range(0, len(true_labels) - 1):
@@ -170,6 +170,35 @@ class mgbc(object):
     fscore, _, _ = pairwise_fscore(self.labels, self.predicted_labels)
     print('\nthreshold %.2f alpha %.2f fscore %.3f'%(
       -self.threshold, self.alpha, fscore))
+
+class lastm(mgbc):
+  """
+  Clustering method using language-agnostic sentence embeddings and cosine 
+  distance for graphs
+  """
+  def __init__(self, data, labels, threshold=0.3, alpha=0.4, 
+    representation=datasets.representation().glove, 
+    semantic=None):
+    super().__init__(data, labels, threshold=threshold,
+      alpha=alpha, representation=representation, semantic=semantic)
+
+  def query_similarity(self, q0, q1):
+    """
+    Compute similarity between the sentence embeddings representing queries. 
+    Use cosine distance for lexical relatedness and ORCAS for semantic 
+    relatedness
+    """
+    semantic_sim = 0
+    if isinstance(q0, str):
+      lexical = self.compute_representation([q0, q1])
+      if self.compute_semantic != None:
+        semantic_sim = self.compute_semantic(q0, q1)
+      q0, q1 = lexical[0], lexical[1]
+
+    cos = np.dot(q0,q1) / (np.linalg.norm(q0)+1e-8) / (np.linalg.norm(q1)+1e-8)
+    lexical_sim = np.clip(cos, -1.0, 1.0)
+    sim = self.alpha * lexical_sim + (1 - self.alpha) * semantic_sim
+    return sim
 
 class brnn(object):
   """
@@ -731,9 +760,9 @@ class task_map(object):
     self.test_time_samples = 10000
     self.test_time_ms = None
     self.runs = 50
-    self.annoy_metric = 'angular'
     self.annoy_n = 9
     self.ngt_distance = 'Normalized Angle'
+    self.scann_leaves = 200
 
   def ngt_predict(self, model, test_data, train_labels):
     """
@@ -786,6 +815,63 @@ class task_map(object):
     Task mapping using NGT
     """
     self.test(self.ngt)
+
+  def scann_predict(self, model, test_data, train_labels):
+    """
+    Predict labels using an ScaNN index structure
+    """
+    predicted_labels = []
+    for test in test_data:
+      results, _ = model.search(test, final_num_neighbors=self.ann_k)
+      votes = {}
+      for result in results:
+        index = result
+        label = train_labels[index]
+        votes[label] = votes.get(label, 0) + 1
+      max_vote, max_count = 0, 0
+      for label in votes.keys():
+        if votes[label] > max_count:
+          max_count = votes[label]
+          max_vote = label
+      predicted_labels.append(max_vote)
+    return predicted_labels
+
+  def scann(self, train_data, train_labels, test_data, test_labels):
+    """
+    Run ScaNN. Compute training and testing times
+
+    [1] https://github.com/google-research/google-research/tree/master/scann
+    """
+    train_time = 0
+    time0 = time.time()
+    
+    model = scann.ScannBuilder(
+      train_data, self.ann_k, "dot_product").tree(
+      num_leaves=330, 
+      num_leaves_to_search=self.scann_leaves, 
+      training_sample_size=25000).score_ah(
+      dimensions_per_block=2, 
+      anisotropic_quantization_threshold=0.2).reorder(
+      reordering_num_neighbors=self.scann_leaves).create_pybind()
+
+    time1 = time.time()
+    predicted_labels = self.scann_predict(model, test_data, train_labels)
+
+    if self.test_time_ms == None:
+      time2 = time.time()
+      self.scann_predict(
+        model, train_data[0:self.test_time_samples], train_labels)
+      time3 = time.time()
+      self.test_time_ms = 1000.0 * (time3 - time2) / (self.test_time_samples)
+
+    train_time = time1 - time0
+    return predicted_labels, train_time
+
+  def map_scann(self):
+    """
+    Task mapping using SCANN
+    """
+    self.test(self.scann)
 
   def test(self, method):
     """
@@ -840,3 +926,51 @@ class task_map(object):
       train_times.append(train_time)
 
     return predicted_labels, expected_labels, train_times
+
+def dc_rnn(pretrain_dataset, dataset, save_dir, runs=5, 
+  pretrain_epochs=10, batch_size=128, maxiter=2e4, update_interval=1,
+  rnn=deep_clustering.IRDCS, pretrain=True, pretrain_lr=1e-4,learning_rate=1e-5,
+  cell='GRU', hidden_units=32, lambda_loss=0.1):
+  """
+  Run deep clustering with a single BiRNN on the provided dataset
+  """
+
+  accs, nmis, aris = [], [], []
+  for _ in range(runs):
+    try:
+      model = rnn(
+        pretrain_dataset=pretrain_dataset, dataset=dataset, model_dir=save_dir)
+      model.EPOCHS = pretrain_epochs
+      model.BATCH_SIZE = batch_size
+      model.LEARNING_RATE = learning_rate
+      model.PRETRAIN_LR  = pretrain_lr
+      model.HIDDEN_UNITS = hidden_units
+      model.CELL = cell
+      model.lambda_loss   = lambda_loss
+      model.build_models()
+
+      # pretraining
+      t0 = time.time()
+      if pretrain == True:
+        model.pretrain()
+      t1 = time.time()
+      print("Time for pretraining: %ds" % (t1 - t0))
+
+      # clustering
+      y_pred = model.cluster(maxiter=maxiter, update_interval=update_interval)
+      acc = unsupervised_accuracy(dataset.labels, y_pred)
+      nmi = metrics.normalized_mutual_info_score(dataset.labels, y_pred)
+      ari = metrics.adjusted_rand_score(dataset.labels, y_pred)
+      print('Final: acc=%.4f, nmi=%.4f, ari=%.4f' %(acc, nmi, ari))
+      accs.append(acc); nmis.append(nmi); aris.append(ari); 
+      t2 = time.time()
+      print("Time for pretaining, clustering and total: (%ds, %ds, %ds)" % (
+        t1 - t0, t2 - t1, t2 - t0))
+    except Exception as e:
+      print('Exception when runing ' + save_dir + str(e))
+
+  print("\n\nTest results\n")
+  print('\tacc : %.3f +/- %.3f'% (np.mean(accs), np.std(accs))) 
+  print('\tnmi : %.3f +/- %.3f'% (np.mean(nmis), np.std(nmis))) 
+  print('\tari : %.3f +/- %.3f'% (np.mean(aris), np.std(aris))) 
+

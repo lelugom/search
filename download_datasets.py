@@ -3,19 +3,24 @@ Download datasets, uncompress, and store them under the datasets folder
 """
 
 import os, re, urllib, urllib.request, gzip, glob, tarfile, zipfile, shutil
+import tensorflow as tf
 
 # Constants
 DATA_DIR = "datasets"
 
 AOL_LEAK = 'https://archive.org/download/AOL_search_data_leak_2006/AOL_search_data_leak_2006.zip'
-AOL_LUCCHESE = "http://miles.isti.cnr.it/~tolomei/?download=aol-task-ground-truth.tar.gz"
+AOL_LUCCHESE = "http://pomino.isti.cnr.it/~tolomei/downloads/aol-task-ground-truth.tar.gz"
 AOL_SEN = "https://raw.githubusercontent.com/procheta/AOLTaskExtraction/master/Task.csv"
-AOL_HAGEN = "http://www.uni-weimar.de/medien/webis/corpora/corpus-webis-smc-12/corpus-webis-smc-12.zip"
+AOL_HAGEN = "https://zenodo.org/record/3265962/files/corpus-webis-smc-12.zip?download=1"
 VOLSKE = "https://zenodo.org/record/3257431/files/webis-qtm-19.zip?download=1"
+ORCAS  = 'https://msmarco.blob.core.windows.net/msmarcoranking/orcas.tsv.gz'
 
 GLOVE = "http://nlp.stanford.edu/data/glove.42B.300d.zip"
-UNIVERSAL_SENTENCE_ENCODER = 'https://tfhub.dev/google/universal-sentence-encoder-large/3'
-M_UNIVERSAL_SENTENCE_ENCODER = 'https://tfhub.dev/google/universal-sentence-encoder-multilingual-large/1'
+if tf.__version__.startswith('2.'):
+  M_UNIVERSAL_SENTENCE_ENCODER = 'https://tfhub.dev/google/universal-sentence-encoder-multilingual-large/3'
+else:
+  M_UNIVERSAL_SENTENCE_ENCODER = 'https://tfhub.dev/google/universal-sentence-encoder-multilingual-large/1'
+LANGUAGE_AGNOSTIC_SENTENCE_E = 'https://tfhub.dev/google/LaBSE/1'
 MUSE_LANGS = ['ar', 'zh', 'zh-tw', 'nl', 'en', 'de', 'fr', 'it', 'pt', 'es', 
   'ja', 'ko', 'ru', 'pl', 'th', 'tr']
 
@@ -89,6 +94,8 @@ def download_files():
     '/'.join([DATA_DIR, "volske"]), "webis-qtm-19.zip", VOLSKE)
   download_file(
     '/'.join([DATA_DIR, "glove"]), "glove.42B.300d.zip", GLOVE)
+  download_file(
+    '/'.join([DATA_DIR, "orcas"]), "orcas.tsv.gz", ORCAS)
 
   consolidate_aol_leak()
 

@@ -7,7 +7,9 @@ import sys, csv, math
 import numpy as np
 from sklearn import metrics
 
-import methods, datasets, download_datasets
+import methods, datasets, download_datasets, deep_clustering
+
+import tensorflow as tf
 
 from sklearn.metrics.pairwise import cosine_similarity
 from scipy.spatial import distance
@@ -265,7 +267,7 @@ def mgbc_task_ide(clueweb_url):
 
 def ngt_task_map():
   """
-  Run task mapping experiments on query task mapping datasets 
+  Run mapping experiments on query task mapping datasets 
   (Volske et al., 2019).
   """
   print('\n\n--- Experiments with NGT')
@@ -295,24 +297,186 @@ def task_ide(clueweb_url=''):
   mgbc_task_ide(clueweb_url)
   ngt_task_map()
 
+def task_ext(representation=datasets.representation(width=8).glove, 
+  save_dir='models/irdcs_model'):
+  lambda_loss = 0.1
+  cell = 'GRU'
+  ui, lr, batch, mi = 1, 1e-5, 128, 150
+
+  # Datasets
+  qdatasets = []
+  qdataset = datasets.sen_aol(representation=representation)
+  qdataset.load_augmented(textdata=False)
+  qdatasets.append(qdataset)
+  qdataset = datasets.volske_trek(representation=representation)
+  qdataset.load_augmented_filter_user(textdata=False)
+  qdatasets.append(qdataset)
+  qdatasets_names = ['Sen et al.', 'Volske et al. Trec ']
+
+  # Clustering
+  for i in range(len(qdatasets)):
+    sen_aol = qdatasets[i]
+    ds_name = qdatasets_names[i]
+
+    print('\n\n--- Experiment RDC ' + ds_name + ' dataset, sequence pretrain')
+    hagen_aol = datasets.hagen_aol(representation=representation)
+    hagen_aol.load_random_pair_dual()
+    pe = 10; plr = 1e-5
+    methods.dc_rnn(pretrain_dataset=hagen_aol, dataset=sen_aol,
+      save_dir=save_dir, rnn=deep_clustering.IRDCS, 
+      pretrain_epochs=pe, batch_size=batch, maxiter=mi, update_interval=ui, 
+      learning_rate=lr, pretrain=True, pretrain_lr=plr, cell=cell)
+    
+    print('\n\n--- Experiment RDC ' + ds_name + ' dataset, segmentation pretrain')
+    hagen_aol = datasets.hagen_aol(representation=representation)
+    hagen_aol.load_sequential_pair_dual()
+    pe = 30; plr = 1e-4
+    methods.dc_rnn(pretrain_dataset=hagen_aol, dataset=sen_aol,
+      save_dir=save_dir, rnn=deep_clustering.IRDCS, 
+      pretrain_epochs=pe, batch_size=batch, maxiter=mi, update_interval=ui, 
+      learning_rate=lr, pretrain=True, pretrain_lr=plr, cell=cell)
+
+    print('\n\n--- Experiment RDC ' + ds_name + ' dataset, no pretrain')
+    methods.dc_rnn(pretrain_dataset=hagen_aol, dataset=sen_aol,
+      save_dir=save_dir, rnn=deep_clustering.IRDCS, 
+      pretrain_epochs=pe, batch_size=batch, maxiter=mi, update_interval=ui, 
+      learning_rate=lr, pretrain=False, pretrain_lr=plr, cell=cell, lambda_loss=lambda_loss)
+
+def lastm(orcas_cache):
+  """
+  Run unsupervised LASTM task modeling. if orcas_cache is True, build the ORCAS
+  index on RAM
+  """
+
+  # Load cache for LABSE representations
+  vectors = datasets.representation()
+  dataset = datasets.sen_aol(representation=vectors.labse)
+  dataset.load(textdata=False)
+  dataset = datasets.wp4_task(representation=vectors.labse)
+  dataset.load(textdata=False)
+  del vectors
+
+  # Load cache for Orcas
+  if orcas_cache:
+    vectors = datasets.representation()
+    orcas = datasets.orcas(representation=vectors.labse)
+    print('Creating ORCAS cache')
+    dataset = datasets.sen_aol(representation=vectors.labse)
+    dataset.load(textdata=True)
+    for query in dataset.data:
+      orcas.retrieve_document_ids_cache(query)
+
+    dataset = datasets.wp4_task(representation=vectors.labse)
+    dataset.load(textdata=True)
+    for query in dataset.data:
+      orcas.retrieve_document_ids_cache(query)
+    del vectors, orcas
+
+  # Clustering 
+  alphas = [alpha for alpha in np.arange(0.0, 1.01, 0.1)]
+  thresholds = [threshold for threshold in np.arange(0.0, 1.01, 0.1)]
+  representation = datasets.representation().labse
+  semantic = datasets.orcas().intent_similarity_ids
+
+  print('\n\n--- Experiment with Sen et al. dataset ')
+  dataset = datasets.sen_aol(representation=representation)
+  dataset.load(textdata=True)
+  for threshold in thresholds:
+    for alpha in alphas:
+      lastm = methods.lastm(
+        dataset.data, dataset.labels, threshold=threshold, 
+        alpha=alpha, representation=representation, semantic=semantic)
+      lastm.cluster()
+
+  print('\n\n--- Experiment with WP4 dataset ')
+  dataset = datasets.sen_aol(representation=representation)
+  dataset.load(textdata=True)
+  dataset.load(textdata=True)
+  for threshold in thresholds:
+    for alpha in alphas:
+      lastm = methods.lastm(
+        dataset.data, dataset.labels, threshold=threshold, 
+        alpha=alpha, representation=representation, semantic=semantic)
+      lastm.cluster()
+
+def scann_task_map():
+  """
+  Run mapping experiments on query task mapping datasets 
+  (Volske et al., 2019).
+  """
+  print('\n\n--- Experiments with LASTM')
+  k = 7
+  leaves = 200
+  vectors = datasets.representation(lang='')
+  representation = vectors.labse
+  
+  volske = datasets.volske_aol(representation=representation)
+  volske.load(textdata=False)
+  volske.data = np.asarray(volske.data)
+  task_map = methods.task_map(dataset=volske)
+  task_map.annoy_n = k
+  task_map.scann_leaves = leaves
+  task_map.map_scann()
+  
+  volske = datasets.volske_trek(representation=representation)
+  volske.load(textdata=False)
+  volske.data = np.asarray(volske.data)
+  task_map = methods.task_map(dataset=volske)
+  task_map.annoy_n = k
+  task_map.scann_leaves = leaves
+  task_map.map_scann()
+
+  volske = datasets.volske_wikihow(representation=representation)
+  volske.load(textdata=False)
+  volske.data = np.asarray(volske.data)
+  task_map = methods.task_map(dataset=volske)
+  task_map.annoy_n = k
+  task_map.scann_leaves = leaves
+  task_map.map_scann()
+
+def task_mod(orcas_cache=False):
+  """
+  Replicate resutls for task modeling experiments
+  """
+  lastm(orcas_cache)
+  scann_task_map()
+
 if __name__ == "__main__":
   print('checking datasets ...')
   download_datasets.download_files()
   
   if len(sys.argv) == 3 and sys.argv[2] == 'segmentation':
+    assert tf.__version__.startswith('1.')
     print('running search segmentation experiments ...')
     task_seg()
   elif len(sys.argv) == 3 and sys.argv[2] == 'identification':
+    assert tf.__version__.startswith('1.')
     print('running task identification experiments ...')
     task_ide()
   elif len(sys.argv) == 5 and sys.argv[2] == 'identification':
+    assert tf.__version__.startswith('1.')
     print('running task identification experiments ...')
     url = sys.argv[4] + '?query='
     task_ide(clueweb_url=url)
+  elif len(sys.argv) == 3 and sys.argv[2] == 'extracting':
+    assert tf.__version__.startswith('1.')
+    print('running task extracting experiments ...')
+    task_ext()
+  elif len(sys.argv) == 3 and sys.argv[2] == 'modeling':
+    assert tf.__version__.startswith('2.')
+    print('running task modeling experiments ...')
+    task_mod(orcas_cache=False)
+  elif len(sys.argv) == 5 and sys.argv[2] == 'modeling':
+    assert tf.__version__.startswith('2.')
+    print('running task modeling experiments ...')
+    task_mod(orcas_cache=True)
   else:
     print("""
       Usage:
       python experiments.py -t segmentation
       python experiments.py -t identification
       python experiments.py -t identification -u clueweb_url
+      python experiments.py -t extracting
+      python experiments.py -t modeling 
+      python experiments.py -t modeling -u orcas_cache
       """)
