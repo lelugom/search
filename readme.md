@@ -25,7 +25,7 @@ pip3 install --upgrade pygtrie==2.3.2 networkx==2.3 ngt==1.11.6 gensim==3.8.1
 
 Additional installation packages will depend on the experiments to replicate. Every section has installation instructions. 
 
-### Containers
+#### Containers
 
 To facilitate code execution, two [Docker](https://www.docker.com/) containers are available with all dependencies installed, select one of them depending on the experiment to run
 
@@ -44,9 +44,12 @@ Multiple datasets are supported for the methods in this repository. The download
 python3 download_datasets.py
 ```
 
-### Complex User Search Task Analysis (CUSTA) dataset
+#### Complex User Search Task Analysis (CUSTA) dataset
 
-In the _datasets/wp4 _folder you can find the _wp4_tasks.csv_ dataset, a collection of queries with ground-truth labels for search tasks, user identifiers, and query timestamps.
+In the _datasets/wp4 _folder you can find the _wp4_tasks.csv_ dataset, a collection of queries with ground-truth labels for search tasks. Each entry contains two columns:
+
+- Query: effet du bruit et du sommeil sur la concentration
+- Label: 3
 
 Reference
 ```
